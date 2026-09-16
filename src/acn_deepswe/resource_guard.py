@@ -217,9 +217,13 @@ def cleanup_finished_trial_images(trial_name: str) -> int:
             continue
         repository = image.get("Repository")
         tag = image.get("Tag")
-        if isinstance(repository, str) and repository in allowed and isinstance(tag, str):
-            if tag != "<none>":
-                references.append(f"{repository}:{tag}")
+        if (
+            isinstance(repository, str)
+            and repository in allowed
+            and isinstance(tag, str)
+            and tag != "<none>"
+        ):
+            references.append(f"{repository}:{tag}")
     for batch in _batches(references, 100):
         _docker(["image", "rm", *batch])
     return len(references)

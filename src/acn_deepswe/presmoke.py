@@ -480,12 +480,10 @@ def _is_completed_task_manifest(spec: PresmokeTaskSpec, path: Path) -> bool:
         observed[attempt_id] = record
     if set(observed) != set(expected):
         return False
-    if not all(
+    return all(
         _has_valid_gated_attempt_evidence(attempt_id, expected[attempt_id], record)
         for attempt_id, record in observed.items()
-    ):
-        return False
-    return True
+    )
 
 
 def _terminal_result_from_task_manifest(

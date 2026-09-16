@@ -256,86 +256,88 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        with exclusive_run_lock(config.output_dir / ".presmoke.lock", "pre-smoke 阶段"):
-            with exclusive_run_lock(GLOBAL_DOCKER_LOCK, "全机 Docker 正式评测"):
-                docker_root = preflight_execution(config)
-                frozen_runtime = stage_python_runtime(config, allow_existing=args.resume)
-                all_specs, frozen_task_ids = build_task_specs(
+        with (
+            exclusive_run_lock(config.output_dir / ".presmoke.lock", "pre-smoke 阶段"),
+            exclusive_run_lock(GLOBAL_DOCKER_LOCK, "全机 Docker 正式评测"),
+        ):
+            docker_root = preflight_execution(config)
+            frozen_runtime = stage_python_runtime(config, allow_existing=args.resume)
+            all_specs, frozen_task_ids = build_task_specs(
+                config,
+                upstream_base_url,
+                resolve_image_digests=True,
+                frozen_runtime=frozen_runtime,
+                docker_root=docker_root,
+            )
+            completion_manifest_path = config.output_dir / "task-completions.json"
+            completed = (
+                load_terminal_task_results(all_specs, completion_manifest_path)
+                if args.resume
+                else ()
+            )
+            failed = [result.task_id for result in completed if result.status == "failed"]
+            if failed:
+                raise PresmokeCliError(
+                    "续跑拒绝覆盖已有失败终态（包括 Gate/协议失败）: " + ",".join(failed)
+                )
+            completed_ids = {result.task_id for result in completed}
+            pending_ids = tuple(
+                task_id for task_id in frozen_task_ids if task_id not in completed_ids
+            )
+            specs = all_specs
+            resume_root: Path | None = None
+            if args.resume and pending_ids:
+                interrupted_ids = tuple(
+                    spec.task_id
+                    for spec in all_specs
+                    if spec.task_id in pending_ids and _task_has_partial_artifacts(spec)
+                )
+                if interrupted_ids and not args.retry_interrupted:
+                    raise PresmokeCliError(
+                        "检测到中断 task；请显式传 --resume --retry-interrupted（每题最多一次）: "
+                        + ",".join(interrupted_ids)
+                    )
+                if interrupted_ids:
+                    reserve_interrupted_retries(completion_manifest_path, interrupted_ids)
+                resume_root = _next_resume_root(config.output_dir)
+                specs, _ = build_task_specs(
                     config,
                     upstream_base_url,
                     resolve_image_digests=True,
                     frozen_runtime=frozen_runtime,
+                    selected_task_ids=set(pending_ids),
+                    attempt_output_root=resume_root,
                     docker_root=docker_root,
                 )
-                completion_manifest_path = config.output_dir / "task-completions.json"
-                completed = (
-                    load_terminal_task_results(all_specs, completion_manifest_path)
-                    if args.resume
-                    else ()
+            elif args.resume:
+                specs = ()
+            # 续跑必须先排除已完成 task，并把中断 task 重定位到新的 resume root；
+            # 否则正常存在的 producer bundle 会被误判为复用旧产物。
+            validate_b_only_sources(specs)
+            if resume_root is not None:
+                _write_resume_descriptor(resume_root, config, completed, specs)
+            runner = PresmokeHostRunner(
+                specs,
+                config.output_dir / "presmoke-aggregate.json",
+                task_workers=config.task_workers,
+                frozen_task_ids=frozen_task_ids,
+                completed_task_results=completed,
+                completion_manifest_path=completion_manifest_path,
+            )
+            signal.signal(signal.SIGINT, _mark_operator_interrupt)
+            results = runner.run(execute=True)
+            status = (
+                "completed_with_no_eligible_claim"
+                if any(item.status == "no_eligible_claim" for item in results)
+                else "passed"
+            )
+            print(
+                json.dumps(
+                    {"status": status, "tasks": [item.to_dict() for item in results]},
+                    ensure_ascii=False,
                 )
-                failed = [result.task_id for result in completed if result.status == "failed"]
-                if failed:
-                    raise PresmokeCliError(
-                        "续跑拒绝覆盖已有失败终态（包括 Gate/协议失败）: " + ",".join(failed)
-                    )
-                completed_ids = {result.task_id for result in completed}
-                pending_ids = tuple(
-                    task_id for task_id in frozen_task_ids if task_id not in completed_ids
-                )
-                specs = all_specs
-                resume_root: Path | None = None
-                if args.resume and pending_ids:
-                    interrupted_ids = tuple(
-                        spec.task_id
-                        for spec in all_specs
-                        if spec.task_id in pending_ids and _task_has_partial_artifacts(spec)
-                    )
-                    if interrupted_ids and not args.retry_interrupted:
-                        raise PresmokeCliError(
-                            "检测到中断 task；请显式传 --resume --retry-interrupted（每题最多一次）: "
-                            + ",".join(interrupted_ids)
-                        )
-                    if interrupted_ids:
-                        reserve_interrupted_retries(completion_manifest_path, interrupted_ids)
-                    resume_root = _next_resume_root(config.output_dir)
-                    specs, _ = build_task_specs(
-                        config,
-                        upstream_base_url,
-                        resolve_image_digests=True,
-                        frozen_runtime=frozen_runtime,
-                        selected_task_ids=set(pending_ids),
-                        attempt_output_root=resume_root,
-                        docker_root=docker_root,
-                    )
-                elif args.resume:
-                    specs = ()
-                # 续跑必须先排除已完成 task，并把中断 task 重定位到新的 resume root；
-                # 否则正常存在的 producer bundle 会被误判为复用旧产物。
-                validate_b_only_sources(specs)
-                if resume_root is not None:
-                    _write_resume_descriptor(resume_root, config, completed, specs)
-                runner = PresmokeHostRunner(
-                    specs,
-                    config.output_dir / "presmoke-aggregate.json",
-                    task_workers=config.task_workers,
-                    frozen_task_ids=frozen_task_ids,
-                    completed_task_results=completed,
-                    completion_manifest_path=completion_manifest_path,
-                )
-                signal.signal(signal.SIGINT, _mark_operator_interrupt)
-                results = runner.run(execute=True)
-                status = (
-                    "completed_with_no_eligible_claim"
-                    if any(item.status == "no_eligible_claim" for item in results)
-                    else "passed"
-                )
-                print(
-                    json.dumps(
-                        {"status": status, "tasks": [item.to_dict() for item in results]},
-                        ensure_ascii=False,
-                    )
-                )
-                return 0
+            )
+            return 0
     except (
         OSError,
         ValueError,

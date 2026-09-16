@@ -136,9 +136,8 @@ class AcnPierAdapterTests(unittest.TestCase):
         ):
             with self.subTest(proxy_url=proxy_url), patch.dict(
                 os.environ, {CONTAINER_MODEL_PROXY_ENV: proxy_url}, clear=False
-            ):
-                with self.assertRaisesRegex(ValueError, CONTAINER_MODEL_PROXY_ENV):
-                    _adapter().direct_model_proxy_env()
+            ), self.assertRaisesRegex(ValueError, CONTAINER_MODEL_PROXY_ENV):
+                _adapter().direct_model_proxy_env()
 
     def test_direct_egress_is_selected_only_from_the_frozen_attempt_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -166,9 +165,8 @@ class AcnPierAdapterTests(unittest.TestCase):
                 CONTAINER_MODEL_EGRESS_ENV: "direct",
             },
             clear=False,
-        ):
-            with self.assertRaisesRegex(ValueError, "不允许覆盖"):
-                _adapter().model_egress_env(attempt)
+        ), self.assertRaisesRegex(ValueError, "不允许覆盖"):
+            _adapter().model_egress_env(attempt)
 
     def test_read_model_key_fails_closed_without_host_key(self) -> None:
         os.environ.pop(HOST_KEY_ENV, None)

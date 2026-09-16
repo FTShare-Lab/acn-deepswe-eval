@@ -14,19 +14,20 @@ class RunLockTests(unittest.TestCase):
             lock = root / "run.lock"
             lock.symlink_to(target)
 
-            with self.assertRaises(RunLockError):
-                with exclusive_run_lock(lock, "fixture"):
-                    pass
+            with self.assertRaises(RunLockError), exclusive_run_lock(lock, "fixture"):
+                pass
 
             self.assertEqual(target.read_text(encoding="utf-8"), "preserve-me")
 
     def test_second_descriptor_cannot_acquire_held_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "run.lock"
-            with exclusive_run_lock(lock, "fixture"):
-                with self.assertRaisesRegex(RunLockError, "另一个进程"):
-                    with exclusive_run_lock(lock, "fixture"):
-                        pass
+            with (
+                exclusive_run_lock(lock, "fixture"),
+                self.assertRaisesRegex(RunLockError, "另一个进程"),
+                exclusive_run_lock(lock, "fixture"),
+            ):
+                pass
 
 
 if __name__ == "__main__":

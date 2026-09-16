@@ -49,9 +49,11 @@ class AutomatedRunTests(unittest.TestCase):
     def test_hidden_key_read_requires_a_nonempty_value(self) -> None:
         with patch("acn_deepswe.auto_run.getpass.getpass", return_value="test-credential"):
             self.assertEqual(_read_upstream_key_stdin(), "test-credential")
-        with patch("acn_deepswe.auto_run.getpass.getpass", return_value=""):
-            with self.assertRaisesRegex(AutomatedRunError, "不能为空"):
-                _read_upstream_key_stdin()
+        with (
+            patch("acn_deepswe.auto_run.getpass.getpass", return_value=""),
+            self.assertRaisesRegex(AutomatedRunError, "不能为空"),
+        ):
+            _read_upstream_key_stdin()
 
     def test_config_forwards_run_a_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

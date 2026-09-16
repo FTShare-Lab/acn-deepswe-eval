@@ -650,7 +650,7 @@ def _progress_observed_at(raw: Mapping[str, object]) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        observed = datetime.fromisoformat(value)
     except ValueError:
         return None
     return observed.astimezone(UTC) if observed.tzinfo is not None else None
