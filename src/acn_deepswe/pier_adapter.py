@@ -1,0 +1,440 @@
+"""Pier `BaseAgent` 适配：上传 ACN 产物、声明出网域名、执行单个 attempt。
+
+模型 key 只经一次性受限文件进入容器，出网由宿主的域名 allowlist 限死，
+适配层不自建代理。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+from .assets import frozen_coding_benchmark_skill
+
+try:
+    from pier.agents.base import BaseAgent
+    from pier.models.agent.network import NetworkAllowlist
+except ModuleNotFoundError:
+
+    class BaseAgent:
+        """未安装 optional runtime 时，仅让纯逻辑模块保持可导入。"""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    NetworkAllowlist = None
+
+if TYPE_CHECKING:
+    from pier.environments.base import BaseEnvironment
+    from pier.models.agent.context import AgentContext
+
+CONTAINER_ROOT = "/opt/acn-eval"
+CONTAINER_ATTEMPT_CONFIG = f"{CONTAINER_ROOT}/attempt.toml"
+CONTAINER_ACN_CONFIG = f"{CONTAINER_ROOT}/acn.toml"
+CONTAINER_CLAIM_BUNDLE = f"{CONTAINER_ROOT}/claims.json"
+CONTAINER_MODEL_KEY_FILE = f"{CONTAINER_ROOT}/model-key"
+CONTAINER_SKILL_PATH = "/logs/agent/runtime/skills/coding-benchmark"
+CONTAINER_MODEL_EGRESS_ENV = "ACN_EVAL_MODEL_EGRESS"
+CONTAINER_MODEL_PROXY_ENV = "ACN_EVAL_CONTAINER_MODEL_PROXY"
+
+
+@dataclass(frozen=True)
+class Upload:
+    local_path: Path
+    remote_path: str
+
+
+@dataclass(frozen=True)
+class SetupPlan:
+    uploads: tuple[Upload, ...]
+    frozen_skill_hash: str
+
+
+def upstream_host(base_url: str) -> str:
+    """从上游 base URL 取出 Squid allowlist 需要的裸主机名。"""
+    match = re.fullmatch(r"https?://([^/:?#]+)(?::\d+)?(?:/.*)?", base_url.strip())
+    if not match:
+        raise ValueError(f"上游 base URL 无法解析出主机名: {base_url}")
+    return match.group(1).lower()
+
+
+class AcnPierAdapter:
+    """可独立测试的宿主适配逻辑：上传清单、出网域名与容器执行命令。"""
+
+    def __init__(
+        self,
+        upstream_base_url: str,
+        host_model_key_env: str,
+        container_model_key_env: str,
+    ) -> None:
+        if not host_model_key_env.strip() or not container_model_key_env.strip():
+            raise ValueError("host_model_key_env 和 container_model_key_env 不能为空")
+        self.upstream_host = upstream_host(upstream_base_url)
+        self.host_model_key_env = host_model_key_env
+        self.container_model_key_env = container_model_key_env
+
+    def network_allowlist(self) -> tuple[str, ...]:
+        """agent 容器只允许访问上游模型域名，其余出网由 Pier 的 Squid 拒绝。"""
+        return (self.upstream_host,)
+
+    def build_setup_plan(
+        self,
+        acn_eval: Path,
+        attempt_config: Path,
+        acn_config: Path,
+        frozen_skill: Path,
+        claim_bundle: Path,
+    ) -> SetupPlan:
+        for artifact in (acn_eval, attempt_config, acn_config, frozen_skill):
+            if not artifact.is_absolute() or not artifact.exists():
+                raise ValueError(f"预构建上传物必须存在且为绝对路径: {artifact}")
+        variant = self._validate_container_attempt_config(attempt_config)
+        if variant in {"B_claim", "B_forced_claim"} and (
+            not claim_bundle.is_absolute() or not claim_bundle.exists()
+        ):
+            raise ValueError(f"{variant} 的冻结 claim bundle 必须存在且为绝对路径")
+        frozen_asset = frozen_coding_benchmark_skill()
+        if frozen_skill.resolve() != frozen_asset.source_path.resolve():
+            raise ValueError("所有评测臂只能注入冻结的 coding-benchmark skill")
+        uploads = [
+            Upload(acn_eval, f"{CONTAINER_ROOT}/acn_eval"),
+            Upload(attempt_config, CONTAINER_ATTEMPT_CONFIG),
+            Upload(acn_config, CONTAINER_ACN_CONFIG),
+            Upload(frozen_skill, CONTAINER_SKILL_PATH),
+        ]
+        if variant in {"B_claim", "B_forced_claim"}:
+            uploads.append(Upload(claim_bundle, CONTAINER_CLAIM_BUNDLE))
+        return SetupPlan(tuple(uploads), frozen_asset.content_hash)
+
+    def read_model_key(self) -> str:
+        """读取仅供本次容器 setup 使用的模型 key，拒绝不能安全写入文件的值。"""
+        key = os.environ.get(self.host_model_key_env)
+        if not key:
+            raise ValueError(f"宿主环境缺少模型 key: {self.host_model_key_env}")
+        if any(char in key for char in ("\x00", "\r", "\n")):
+            raise ValueError("模型 key 不能包含空字节或换行")
+        return key
+
+    def container_process_env(self, proxy_env: dict[str, str] | None) -> dict[str, str]:
+        """仅保留 Pier 代理变量；模型 key 不得进入 docker compose 的 argv。"""
+        environment = dict(proxy_env or {})
+        environment.pop(self.host_model_key_env, None)
+        environment.pop(self.container_model_key_env, None)
+        return environment
+
+    def direct_model_proxy_env(self) -> dict[str, str]:
+        """返回供容器进程直连模型的可选代理覆盖。
+
+        仅当冻结 attempt TOML 选择 ``model_egress_mode = "direct"`` 时调用。
+        宿主若只能经本地代理访问模型，可提供容器可达的 HTTP 代理地址；这类运行
+        会被 Formal Gate 标为非正式，不能用于正式得分。
+        """
+        proxy_url = os.environ.get(CONTAINER_MODEL_PROXY_ENV)
+        if proxy_url is None or not proxy_url.strip():
+            return {}
+        proxy_url = proxy_url.strip()
+        parsed = urlparse(proxy_url)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError(
+                f"{CONTAINER_MODEL_PROXY_ENV} 必须是无凭据的 http://host:port"
+            ) from error
+        if (
+            parsed.scheme != "http"
+            or not parsed.hostname
+            or port is None
+            or port < 1
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                f"{CONTAINER_MODEL_PROXY_ENV} 必须是无凭据的 http://host:port"
+            )
+        return {
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+            "http_proxy": proxy_url,
+            "https_proxy": proxy_url,
+        }
+
+    def model_egress_env(self, attempt_config: Path) -> dict[str, str]:
+        """只按冻结 attempt TOML 决定模型出口，拒绝环境变量隐式覆盖。"""
+        if os.environ.get(CONTAINER_MODEL_EGRESS_ENV) is not None:
+            raise ValueError(
+                f"{CONTAINER_MODEL_EGRESS_ENV} 不允许覆盖冻结的 model_egress_mode"
+            )
+        mode = self._model_egress_mode(attempt_config)
+        if mode == "pier":
+            if os.environ.get(CONTAINER_MODEL_PROXY_ENV):
+                raise ValueError(
+                    f"{CONTAINER_MODEL_PROXY_ENV} 只能与 model_egress_mode=direct 一起使用"
+                )
+            return {}
+        direct_proxy = self.direct_model_proxy_env()
+        if direct_proxy:
+            return direct_proxy
+        # 覆盖 Pier 注入的 proxy。NO_PROXY=* 同时覆盖经由 Python、Rust HTTP client
+        # 的实现差异；该环境只传给运行 ACN 的第一个容器进程。
+        return {
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "http_proxy": "",
+            "https_proxy": "",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+        }
+
+    @staticmethod
+    def _model_egress_mode(path: Path) -> str:
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise ValueError(f"无法解析 attempt config: {path}") from error
+        mode = raw.get("model_egress_mode")
+        if mode not in {"pier", "direct"}:
+            raise ValueError("attempt config model_egress_mode 必须为 pier 或 direct")
+        return mode
+
+    def build_run_command(self) -> str:
+        return (
+            "set -eu; "
+            f"export {self.container_model_key_env}=\"$(cat {CONTAINER_MODEL_KEY_FILE})\"; "
+            f"rm -f {CONTAINER_MODEL_KEY_FILE}; "
+            f"cd /app && exec {CONTAINER_ROOT}/acn_eval --config {CONTAINER_ATTEMPT_CONFIG}"
+            " > /logs/agent/acn_eval.stdout 2> /logs/agent/acn_eval.stderr"
+        )
+
+    def build_commit_command(self, task_id: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", task_id):
+            raise ValueError("task_id 仅允许字母、数字、点、下划线和连字符")
+        return (
+            "git add -A && "
+            "git -c user.name=acn-eval -c user.email=eval@invalid "
+            f"commit -m 'acn DeepSWE {task_id}' || true"
+        )
+
+    def container_post_run_env(self, proxy_env: dict[str, str] | None) -> dict[str, str]:
+        """提交阶段复用代理配置，但绝不把模型 key 传给第二个容器进程。"""
+        env = dict(proxy_env or {})
+        env.pop(self.host_model_key_env, None)
+        env.pop(self.container_model_key_env, None)
+        return env
+
+    @staticmethod
+    def _validate_container_attempt_config(path: Path) -> str:
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise ValueError(f"无法解析 attempt config: {path}") from error
+        required = {
+            "workspace_root": "/app",
+            "runtime_root": "/logs/agent/runtime",
+            "output_dir": "/logs/agent/evaluation",
+            "acn_config": CONTAINER_ACN_CONFIG,
+        }
+        for field, expected in required.items():
+            if raw.get(field) != expected:
+                raise ValueError(f"attempt config {field} 必须为 {expected}")
+        variant = raw.get("variant")
+        model_egress_mode = raw.get("model_egress_mode")
+        if model_egress_mode not in {"pier", "direct"}:
+            raise ValueError("attempt config model_egress_mode 必须为 pier 或 direct")
+        bundle = raw.get("claim_bundle")
+        if variant in {"B_claim", "B_forced_claim"} and bundle != CONTAINER_CLAIM_BUNDLE:
+            raise ValueError(f"{variant} 的 claim_bundle 必须为 {CONTAINER_CLAIM_BUNDLE}")
+        if variant in {"A", "B_empty"} and bundle is not None:
+            raise ValueError(f"{variant} 不得设置 claim_bundle")
+        if variant not in {"A", "B_empty", "B_claim", "B_forced_claim"}:
+            raise ValueError("attempt config variant 必须为 A/B_empty/B_claim/B_forced_claim")
+        return variant
+
+
+class AcnEvalPierAgent(BaseAgent):
+    """由 Pier 以 `acn_deepswe.pier_adapter:AcnEvalPierAgent` 加载的真实 BaseAgent。"""
+
+    def __init__(
+        self,
+        *args: object,
+        acn_eval: str,
+        attempt_config: str,
+        acn_config: str,
+        frozen_skill: str,
+        claim_bundle: str,
+        upstream_base_url: str,
+        host_model_key_env: str,
+        container_model_key_env: str,
+        acn_version: str,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.acn_eval = Path(acn_eval)
+        self.attempt_config = Path(attempt_config)
+        self.acn_config = Path(acn_config)
+        self.frozen_skill = Path(frozen_skill)
+        self.claim_bundle = Path(claim_bundle)
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", acn_version):
+            raise ValueError("acn_version 必须是 x.y.z 版本")
+        self.acn_version = acn_version
+        self.adapter = AcnPierAdapter(
+            upstream_base_url,
+            host_model_key_env,
+            container_model_key_env,
+        )
+
+    @staticmethod
+    def name() -> str:
+        return "acn_eval"
+
+    @classmethod
+    def import_path(cls) -> str:
+        return f"{cls.__module__}:{cls.__name__}"
+
+    def version(self) -> str:
+        return self.acn_version
+
+    def network_allowlist(self) -> object:
+        domains = list(self.adapter.network_allowlist())
+        if NetworkAllowlist is None:
+            return tuple(domains)
+        return NetworkAllowlist(domains=domains)
+
+    async def setup(self, environment: BaseEnvironment) -> None:
+        model_key = self.adapter.read_model_key()
+        created = await environment.exec(
+            f"mkdir -p {CONTAINER_ROOT} /logs/agent/runtime/skills /logs/agent/evaluation",
+            user="root",
+            timeout_sec=30,
+        )
+        if created.return_code != 0:
+            raise RuntimeError("Pier setup 无法创建 ACN 运行目录")
+        setup = self.adapter.build_setup_plan(
+            self.acn_eval,
+            self.attempt_config,
+            self.acn_config,
+            self.frozen_skill,
+            self.claim_bundle,
+        )
+        for upload in setup.uploads:
+            if upload.local_path.is_dir():
+                await environment.upload_dir(upload.local_path, upload.remote_path)
+            else:
+                await environment.upload_file(upload.local_path, upload.remote_path)
+        key_path = _write_ephemeral_model_key(model_key)
+        try:
+            await environment.upload_file(key_path, CONTAINER_MODEL_KEY_FILE)
+        finally:
+            key_path.unlink(missing_ok=True)
+        permissions = await environment.exec(
+            f"chmod 0755 {CONTAINER_ROOT}/acn_eval && chmod 0600 {CONTAINER_MODEL_KEY_FILE}",
+            user="root",
+            timeout_sec=30,
+        )
+        if permissions.return_code != 0:
+            raise RuntimeError("Pier setup 无法设置 acn_eval 可执行权限")
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        del instruction  # attempt TOML 是唯一任务输入，避免把任务文本另行放入 argv。
+        model_egress_env = self.adapter.model_egress_env(self.attempt_config) or None
+        result = await environment.exec(
+            self.adapter.build_run_command(),
+            cwd="/app",
+            env=self.adapter.container_process_env(
+                environment.agent_process_env(model_egress_env)
+            ),
+        )
+        await environment.exec(
+            self.adapter.build_commit_command("attempt"),
+            cwd="/app",
+            env=self.adapter.container_post_run_env(
+                environment.agent_process_env(None)
+            ),
+        )
+        context.metadata = {"acn_eval_exit_code": result.return_code}
+
+
+class AcnPatchReplayPierAgent(BaseAgent):
+    """只重放既有 patch，供已知 verifier 基础设施故障进行一次隔离重判。"""
+
+    def __init__(
+        self,
+        *args: object,
+        patch_path: str,
+        patch_sha256: str,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.patch_path = Path(patch_path)
+        if not self.patch_path.is_absolute() or not self.patch_path.is_file():
+            raise ValueError("patch_path 必须是存在的绝对文件路径")
+        if not re.fullmatch(r"[0-9a-f]{64}", patch_sha256):
+            raise ValueError("patch_sha256 必须是小写 SHA-256")
+        self.patch_sha256 = patch_sha256
+
+    @staticmethod
+    def name() -> str:
+        return "acn_patch_replay"
+
+    @classmethod
+    def import_path(cls) -> str:
+        return f"{cls.__module__}:{cls.__name__}"
+
+    def version(self) -> str:
+        return "1.0.1"
+
+    async def setup(self, environment: BaseEnvironment) -> None:
+        created = await environment.exec(
+            f"mkdir -p {CONTAINER_ROOT}", user="root", timeout_sec=30
+        )
+        if created.return_code != 0:
+            raise RuntimeError("Pier verifier 重判无法创建上传目录")
+        await environment.upload_file(self.patch_path, f"{CONTAINER_ROOT}/model.patch")
+
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        del instruction
+        command = (
+            "set -eu; cd /app; "
+            f"if [ -s {CONTAINER_ROOT}/model.patch ]; then "
+            f"git apply --check {CONTAINER_ROOT}/model.patch; "
+            # 部分官方镜像的 index 元数据会让 `git apply --index` 在 worktree 完全
+            # 匹配时仍误报 does not match index；先校验 worktree，再显式 stage。
+            f"git apply {CONTAINER_ROOT}/model.patch; "
+            "git add -A; "
+            "git -c user.name=acn-eval -c user.email=eval@invalid "
+            "commit -m 'replay frozen evaluation patch'; "
+            "fi"
+        )
+        result = await environment.exec(command, cwd="/app", timeout_sec=300)
+        if result.return_code != 0:
+            raise RuntimeError("冻结 patch 无法在全新任务环境中重放")
+        context.metadata = {
+            "patch_sha256": self.patch_sha256,
+            "replay_exit_code": result.return_code,
+        }
+
+
+def _write_ephemeral_model_key(key: str) -> Path:
+    """写入仅供 Pier upload_file 消费的 0600 临时文件，调用者必须立即删除。"""
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="acn-eval-model-key-",
+        delete=False,
+    ) as handle:
+        handle.write(key)
+        handle.write("\n")
+        return Path(handle.name)

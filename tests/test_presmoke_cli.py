@@ -1,0 +1,1355 @@
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+from acn_deepswe.presmoke import PresmokeTaskResult, load_terminal_task_results
+from acn_deepswe.presmoke_cli import (
+    PresmokeCliError,
+    _effective_config_hash,
+    _ensure_frozen_task_images_available,
+    _task_has_partial_artifacts,
+    _verify_acn_eval_build_info,
+    build_task_specs,
+    load_config,
+    main,
+    preflight_execution,
+    stage_python_runtime,
+    verify_acn_revision,
+    verify_checkout_revision,
+    verify_pier_executable_binding,
+)
+from acn_deepswe.provenance import TASK_DIRECTORY_HASH_ALGORITHM, sha256_directory_tree
+from acn_deepswe.resource_guard import CleanupSummary
+
+TASK_IDS = (
+    "bandit-structured-nosec-directives",
+    "ipython-session-bundle-replay",
+    "koota-entity-snapshot-rollback",
+    "pwntools-tube-multiplexing",
+    "sql-formatter-bigquery-pipe-formatting",
+)
+
+
+class PresmokeCliTests(unittest.TestCase):
+    def test_resume_recovers_failure_before_checkpoint_and_detects_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+            spec = specs[0]
+            self.assertFalse(_task_has_partial_artifacts(spec))
+            resume = config.output_dir / "resumes" / "resume-001"
+            output = resume / "attempts" / spec.experiment.attempts[0].attempt_id / "output"
+            output.mkdir(parents=True)
+            self.assertTrue(_task_has_partial_artifacts(spec))
+            manifest = resume / "tasks" / spec.task_id / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({
+                "attempt_results": [], "failure": "GATE_FAILED"
+            }))
+
+            terminal = load_terminal_task_results(specs, config.output_dir / "task-completions.json")
+
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].status, "failed")
+        self.assertEqual(Path(terminal[0].manifest_path), manifest)
+
+    def test_directory_tree_hash_covers_instruction_environment_and_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory) / "task"
+            (task / "environment").mkdir(parents=True)
+            (task / "tests").mkdir()
+            (task / "task.toml").write_text("task", encoding="utf-8")
+            (task / "instruction.md").write_text("instruction", encoding="utf-8")
+            (task / "environment" / "Dockerfile").write_text("FROM base", encoding="utf-8")
+            (task / "tests" / "test_task.py").write_text("assert True", encoding="utf-8")
+            initial = sha256_directory_tree(task)
+            (task / "instruction.md").write_text("changed instruction", encoding="utf-8")
+            self.assertNotEqual(initial, sha256_directory_tree(task))
+            (task / "instruction.md").write_text("instruction", encoding="utf-8")
+            initial = sha256_directory_tree(task)
+            (task / "environment" / "Dockerfile").write_text("FROM changed", encoding="utf-8")
+            self.assertNotEqual(initial, sha256_directory_tree(task))
+            (task / "environment" / "Dockerfile").write_text("FROM base", encoding="utf-8")
+            initial = sha256_directory_tree(task)
+            (task / "tests" / "test_task.py").write_text("assert False", encoding="utf-8")
+            self.assertNotEqual(initial, sha256_directory_tree(task))
+
+    def test_directory_tree_hash_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory) / "task"
+            task.mkdir()
+            (task / "task.toml").write_text("task", encoding="utf-8")
+            (task / "linked.txt").symlink_to(task / "task.toml")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                sha256_directory_tree(task)
+
+    def test_directory_tree_hash_covers_executable_bit_and_empty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory) / "task"
+            task.mkdir()
+            script = task / "script.sh"
+            script.write_text("#!/bin/sh\n", encoding="utf-8")
+            initial = sha256_directory_tree(task)
+            script.chmod(0o755)
+            self.assertNotEqual(initial, sha256_directory_tree(task))
+            script.chmod(0o644)
+            initial = sha256_directory_tree(task)
+            (task / "empty").mkdir()
+            self.assertNotEqual(initial, sha256_directory_tree(task))
+
+    def test_required_directory_hash_freezes_non_toml_task_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            config = load_config(config_path)
+            task_id = TASK_IDS[0]
+            (config.source_tasks_root / task_id / "environment" / "Dockerfile").write_text(
+                "FROM changed", encoding="utf-8"
+            )
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                self.assertRaisesRegex(PresmokeCliError, "source task 目录.*hash 不匹配"),
+            ):
+                build_task_specs(config, "https://upstream.invalid")
+
+    def test_manifest_without_directory_hashes_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            manifest_path = Path(
+                json.loads(config_path.read_text(encoding="utf-8"))["frozen_manifest"]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("task_directory_hashes")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                self.assertRaisesRegex(PresmokeCliError, "task_directory_hashes"),
+            ):
+                build_task_specs(load_config(config_path), "https://upstream.invalid")
+
+    def test_manifest_without_directory_hash_algorithm_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            manifest_path = Path(
+                json.loads(config_path.read_text(encoding="utf-8"))["frozen_manifest"]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("task_directory_hash_algorithm")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                self.assertRaisesRegex(PresmokeCliError, "task_directory_hash_algorithm"),
+            ):
+                build_task_specs(load_config(config_path), "https://upstream.invalid")
+
+    def test_plan_seed_is_independent_of_dataset_sampling_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "harness_mode": "open_code_like",
+                    "claim_quality_gate": "verified_producer_only",
+                    "run_a_only": True,
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+            plan = json.loads(config.attempt_plan.read_text(encoding="utf-8"))
+            plan["seed"] = 20260727
+            config.attempt_plan.write_text(json.dumps(plan), encoding="utf-8")
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        self.assertEqual(specs[0].experiment.provenance.dataset_seed, 20260726)
+        self.assertEqual(
+            tuple(attempt.variant for attempt in specs[0].experiment.attempts),
+            ("A", "B_empty", "B_claim", "B_forced_claim"),
+        )
+        self.assertTrue(
+            all(
+                spec.execution is None or not spec.execution.require_eligible_claim
+                for spec in specs
+            )
+        )
+        self.assertTrue(
+            all(
+                spec.execution is None
+                or (
+                    spec.execution.harness_mode == "open_code_like"
+                    and spec.execution.claim_quality_gate == "verified_producer_only"
+                    and spec.execution.run_a_only
+                )
+                for spec in specs
+            )
+        )
+
+    def test_b_only_config_uses_source_a_and_current_b_output_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            source_output = root / "a-only-output"
+            raw.update(
+                {
+                    "b_only_from_a_output_dir": str(source_output),
+                    "run_all_variants_without_claims": True,
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        spec = specs[0]
+        assert spec.execution is not None
+        self.assertEqual(
+            spec.execution.a_only_source_manifest,
+            source_output / "tasks" / spec.task_id / "manifest.json",
+        )
+        self.assertEqual(
+            spec.execution.artifacts.claim_bundle,
+            source_output / "tasks" / spec.task_id / "claims.json",
+        )
+        self.assertEqual(
+            Path(spec.experiment.attempts[0].output_path),
+            source_output / "attempts" / spec.experiment.attempts[0].attempt_id / "output",
+        )
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(root / "attempts")
+                for attempt in spec.experiment.attempts[1:]
+            )
+        )
+
+    def test_full_run_can_bind_b_empty_as_claim_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["claim_producer_variant"] = "B_empty"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        spec = specs[0]
+        assert spec.execution is not None
+        task_output = config.output_dir / "tasks" / spec.task_id
+        self.assertEqual(spec.execution.claim_producer_variant, "B_empty")
+        self.assertEqual(
+            spec.execution.artifacts.claim_bundle,
+            task_output / "claims-b-empty.json",
+        )
+        self.assertEqual(
+            spec.execution.artifacts.a_claim_bundle,
+            task_output / "claims.json",
+        )
+        self.assertEqual(
+            spec.execution.artifacts.b_empty_claim_bundle,
+            task_output / "claims-b-empty.json",
+        )
+
+    def test_adaptive_consumer_resolves_global_winner_and_preserves_output_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            source_output = root / "producer-output"
+            aggregate = source_output / "presmoke-aggregate.json"
+            aggregate.parent.mkdir(parents=True)
+            aggregate.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+            task_sources: dict[str, dict[str, str]] = {}
+            for index, task_id in enumerate(TASK_IDS):
+                task_source = (
+                    source_output / "resumes" / "resume-001"
+                    if index == 0
+                    else source_output
+                )
+                manifest = task_source / "tasks" / task_id / "manifest.json"
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(json.dumps({"task_id": task_id}), encoding="utf-8")
+                task_sources[task_id] = {
+                    "source_output_dir": str(task_source),
+                    "task_manifest_path": str(manifest),
+                    "task_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                }
+            selection = root / "producer-selection.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "selected",
+                        "candidate_aliases": {"S1": "A", "S2": "B_empty"},
+                        "winner_variant": "B_empty",
+                        "source_output_dir": str(source_output),
+                        "producer_aggregate_path": str(aggregate),
+                        "producer_aggregate_sha256": hashlib.sha256(
+                            aggregate.read_bytes()
+                        ).hexdigest(),
+                        "task_order": list(TASK_IDS),
+                        "task_sources": task_sources,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            raw.update(
+                {
+                    "claim_producer_variant": "adaptive",
+                    "adaptive_source_output_dir": str(source_output),
+                    "producer_selection_manifest": str(selection),
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+
+        spec = specs[0]
+        assert spec.execution is not None
+        selected_task_source = (source_output / "resumes" / "resume-001").resolve()
+        self.assertEqual(spec.execution.claim_producer_variant, "B_empty")
+        self.assertEqual(
+            spec.execution.artifacts.claim_bundle,
+            selected_task_source / "tasks" / spec.task_id / "claims-b-empty.json",
+        )
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(selected_task_source)
+                for attempt in spec.experiment.attempts[:2]
+            )
+        )
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(config.attempt_plan.parent)
+                and not Path(attempt.output_path).is_relative_to(source_output)
+                for attempt in spec.experiment.attempts[2:]
+            )
+        )
+        self.assertEqual(
+            spec.execution.adaptive_source_manifest,
+            selected_task_source / "tasks" / spec.task_id / "manifest.json",
+        )
+
+    def test_b_only_config_is_mutually_exclusive_with_run_a_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "run_a_only": True,
+                    "b_only_from_a_output_dir": str(root / "a-only-output"),
+                }
+            )
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            with self.assertRaisesRegex(PresmokeCliError, "不能同时启用"):
+                load_config(config_path)
+
+    def test_b_only_config_rejects_overlapping_output_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["b_only_from_a_output_dir"] = raw["output_dir"]
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            with self.assertRaisesRegex(PresmokeCliError, "必须完全隔离"):
+                load_config(config_path)
+
+    def test_b_only_source_a_output_is_not_mistaken_for_an_interrupted_b_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = write_fixture(root)
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            source_output = root / "a-only-output"
+            raw["b_only_from_a_output_dir"] = str(source_output)
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(load_config(config_path), "https://upstream.invalid")
+            spec = specs[0]
+            Path(spec.experiment.attempts[0].output_path).mkdir(parents=True)
+
+            self.assertFalse(_task_has_partial_artifacts(spec))
+            Path(spec.experiment.attempts[1].output_path).mkdir(parents=True)
+            self.assertTrue(_task_has_partial_artifacts(spec))
+
+    def test_checkout_revision_rejects_dirty_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            checkout.mkdir()
+            with (
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=[
+                        completed(["git"], stdout="frozen-revision\n"),
+                        completed(["git"], stdout=" M src.py\n"),
+                    ],
+                ),
+                self.assertRaisesRegex(PresmokeCliError, "工作树不干净"),
+            ):
+                verify_checkout_revision(checkout, "frozen-revision")
+
+    def test_acn_revision_rejects_dirty_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            with (
+                patch(
+                    "acn_deepswe.presmoke_cli._run_checkout_git",
+                    side_effect=[
+                        completed(["git"], stdout="abc123\n"),
+                        completed(["git"], stdout=" M file.py\n"),
+                    ],
+                ),
+                self.assertRaisesRegex(PresmokeCliError, "工作树不干净"),
+            ):
+                verify_acn_revision(
+                    "abc123",
+                    "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+                    "0.2.5",
+                    checkout,
+                )
+
+    def test_staged_python_runtime_is_immutable_after_sources_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            with patch("acn_deepswe.presmoke_cli.verify_acn_revision"):
+                runtime = stage_python_runtime(config)
+            staged_pier = runtime.pier_source_root / "pier" / "__init__.py"
+            before = staged_pier.read_text(encoding="utf-8")
+
+            (config.pier_checkout / "src" / "pier" / "__init__.py").write_text(
+                "changed\n", encoding="utf-8"
+            )
+
+            self.assertEqual(staged_pier.read_text(encoding="utf-8"), before)
+            self.assertFalse(staged_pier.stat().st_mode & 0o222)
+
+    def test_staged_python_runtime_ignores_interpreter_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            cache = config.pier_checkout / "src" / "pier" / "__pycache__"
+            cache.mkdir()
+            (cache / "module.cpython-312.pyc").write_bytes(b"generated")
+
+            with patch("acn_deepswe.presmoke_cli.verify_acn_revision"):
+                runtime = stage_python_runtime(config)
+            staged_pier = runtime.pier_source_root / "pier"
+            self.assertTrue((staged_pier / "__init__.py").is_file())
+            self.assertFalse((staged_pier / "__pycache__").exists())
+
+    def test_resume_reuses_frozen_runtime_and_relocates_pending_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            with patch("acn_deepswe.presmoke_cli.verify_acn_revision"):
+                original_runtime = stage_python_runtime(config)
+                resumed_runtime = stage_python_runtime(config, allow_existing=True)
+            resume_root = config.output_dir / "resumes" / "resume-001"
+            with patch("acn_deepswe.presmoke_cli.verify_checkout_revision"):
+                specs, _ = build_task_specs(
+                    config,
+                    "https://upstream.invalid",
+                    frozen_runtime=resumed_runtime,
+                    selected_task_ids={TASK_IDS[1]},
+                    attempt_output_root=resume_root,
+                )
+
+        self.assertEqual(
+            resumed_runtime.acn_package_tree_hash, original_runtime.acn_package_tree_hash
+        )
+        self.assertEqual(tuple(spec.task_id for spec in specs), (TASK_IDS[1],))
+        self.assertTrue(
+            all(
+                Path(attempt.output_path).is_relative_to(resume_root / "attempts")
+                for attempt in specs[0].experiment.attempts
+            )
+        )
+        self.assertTrue(specs[0].manifest_path.is_relative_to(resume_root / "tasks"))
+
+    def test_build_info_probe_receives_no_upstream_credential(self) -> None:
+        response = completed(
+            ["acn_eval", "--build-info-json"],
+            stdout=json.dumps(
+                {
+                    "version": "0.2.5",
+                    "commit": "a" * 40,
+                    "commit_timestamp": "2026-08-28 00:00:00",
+                }
+            ),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin", "ACN_EVAL_UPSTREAM_KEY": "must-not-leak"},
+                clear=True,
+            ),
+            patch("acn_deepswe.presmoke_cli.subprocess.run", return_value=response) as run,
+        ):
+            _verify_acn_eval_build_info(
+                Path("/tmp/acn_eval"), expected_revision="a" * 40, expected_version="0.2.5",
+                image="sha256:" + "1" * 64,
+            )
+
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin"})
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["docker", "run", "--rm"])
+        self.assertIn("linux/amd64", command)
+        self.assertEqual(command[command.index("--network") + 1], "none")
+        self.assertEqual(command[-2:], ["sha256:" + "1" * 64, "--build-info-json"])
+
+    def test_dry_run_does_not_execute_linux_binary_on_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            config.acn_eval.write_bytes(b"\x7fELF")
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info") as probe,
+            ):
+                specs, _ = build_task_specs(config, "https://upstream.invalid")
+            self.assertTrue(specs)
+            probe.assert_not_called()
+
+    def test_pier_executable_binding_requires_checkout_source_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout, executable = write_pier_venv(Path(directory))
+            evidence = pier_install_evidence(checkout)
+            with patch(
+                "acn_deepswe.presmoke_cli._run_preflight_command",
+                return_value=completed(["python"], stdout=json.dumps(evidence)),
+            ):
+                verify_pier_executable_binding(checkout, executable)
+
+    def test_pier_executable_binding_rejects_external_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, executable = write_pier_venv(root)
+            foreign = root / "foreign-pier"
+            foreign.mkdir()
+            evidence = pier_install_evidence(foreign)
+            with (
+                patch(
+                    "acn_deepswe.presmoke_cli._run_preflight_command",
+                    return_value=completed(["python"], stdout=json.dumps(evidence)),
+                ),
+                self.assertRaisesRegex(PresmokeCliError, "来源不匹配"),
+            ):
+                verify_pier_executable_binding(checkout, executable)
+
+    def test_pier_executable_binding_rejects_noneditable_install(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout, executable = write_pier_venv(Path(directory))
+            evidence = pier_install_evidence(checkout)
+            evidence["direct_url"] = json.dumps(
+                {"url": checkout.as_uri(), "dir_info": {"editable": False}}
+            )
+            with (
+                patch(
+                    "acn_deepswe.presmoke_cli._run_preflight_command",
+                    return_value=completed(["python"], stdout=json.dumps(evidence)),
+                ),
+                self.assertRaisesRegex(PresmokeCliError, "editable"),
+            ):
+                verify_pier_executable_binding(checkout, executable)
+
+    def test_pier_executable_binding_rejects_foreign_console_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout, executable = write_pier_venv(Path(directory))
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "同一 venv"):
+                verify_pier_executable_binding(checkout, executable)
+
+    def test_checked_in_presmoke_manifest_freezes_every_task_directory(self) -> None:
+        manifest_path = Path(__file__).parents[1] / "manifests" / "presmoke-v1.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["task_directory_hash_algorithm"], TASK_DIRECTORY_HASH_ALGORITHM)
+        hashes = manifest["task_directory_hashes"]
+        self.assertEqual(set(hashes), set(manifest["task_ids"]))
+        for task_id in manifest["task_ids"]:
+            self.assertEqual(set(hashes[task_id]), {"source", "normalized"})
+            self.assertTrue(all(len(value) == 64 for value in hashes[task_id].values()))
+
+    def test_missing_upstream_key_returns_nonzero_without_leaking_environment_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            environment = {"ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid"}
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--config", str(config)])
+        self.assertNotEqual(raised.exception.code, 0)
+
+    def test_dry_run_prints_plan_without_secret_or_runner_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            secret = "do-not-print-this-key"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": secret,
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner") as runner,
+                patch("sys.stdout") as stdout,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+            ):
+                result = main(["--config", str(config), "--dry-run"])
+        self.assertEqual(result, 0)
+        runner.assert_not_called()
+        rendered = "".join(str(call.args[0]) for call in stdout.write.call_args_list)
+        self.assertNotIn(secret, rendered)
+        self.assertIn("B_claim", rendered)
+        self.assertIn("task_workers", rendered)
+        self.assertIn("fixture-model", rendered)
+        self.assertIn("fixture-checkpoint", rendered)
+
+    def test_response_model_is_required_and_not_implicitly_copied_from_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.pop("response_model")
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "response_model"):
+                load_config(config_path)
+
+    def test_reasoning_effort_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.pop("reasoning_effort")
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "reasoning_effort"):
+                load_config(config_path)
+
+    def test_formal_config_accepts_disabled_file_edit_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["file_edit_authority_enabled"] = False
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertFalse(config.file_edit_authority_enabled)
+
+    def test_formal_config_accepts_minimal_harness_with_pier_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "run_class": "formal",
+                    "harness_mode": "minimal",
+                    "model_egress_mode": "pier",
+                }
+            )
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertEqual(config.harness_mode, "minimal")
+        self.assertEqual(config.model_egress_mode, "pier")
+
+    def test_formal_minimal_config_rejects_direct_model_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "run_class": "formal",
+                    "harness_mode": "minimal",
+                    "model_egress_mode": "direct",
+                }
+            )
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "model_egress_mode=pier"):
+                load_config(config_path)
+
+    def test_formal_config_requires_transient_docker_budget_per_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "8192"):
+                load_config(config_path)
+
+    def test_formal_config_does_not_preallocate_nominal_task_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = load_config(config_path)
+        self.assertEqual(config.resources["storage_mb"], 1024)
+        self.assertEqual(config.host_capacity["disk_admission_mb_per_worker"], 8192)
+
+    def test_formal_config_rejects_a_different_product_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["acn_main_revision"] = "a" * 40
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "9b818d70"):
+                load_config(config_path)
+
+    def test_formal_config_requires_the_frozen_pier_proxy_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["run_class"] = "formal"
+            raw["pier_egress_proxy_image"] = "other/image:latest"
+            raw["host_capacity"]["disk_admission_mb_per_worker"] = 8192
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "Pier egress proxy"):
+                load_config(config_path)
+
+    def test_effective_config_hash_locks_response_model_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+        changed = replace(config, response_model="other-checkpoint")
+        self.assertNotEqual(_effective_config_hash(config), _effective_config_hash(changed))
+        changed_effort = replace(config, reasoning_effort="high")
+        self.assertNotEqual(_effective_config_hash(config), _effective_config_hash(changed_effort))
+        changed_proxy = replace(config, pier_egress_proxy_content_digest="sha256:" + "2" * 64)
+        self.assertNotEqual(_effective_config_hash(config), _effective_config_hash(changed_proxy))
+        changed_progress = replace(config, progress={"poll_secs": 15, "stall_after_secs": 600})
+        self.assertNotEqual(
+            _effective_config_hash(config), _effective_config_hash(changed_progress)
+        )
+
+    def test_preflight_protects_and_verifies_the_frozen_proxy_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(
+                load_config(write_fixture(Path(directory))),
+                cleanup_stale_pier_resources=True,
+            )
+            docker_root = Path(directory) / "docker"
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_pier_executable_binding"),
+                patch(
+                    "acn_deepswe.presmoke_cli._run_preflight_command",
+                    side_effect=[
+                        type("Completed", (), {"returncode": 0})(),
+                        type("Completed", (), {"returncode": 0, "stdout": "{}"})(),
+                    ],
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.cleanup_stale_pier_resources",
+                    return_value=CleanupSummary(0, 0),
+                ) as cleanup,
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value=config.pier_egress_proxy_content_digest,
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli._verify_docker_capacity",
+                    return_value=docker_root,
+                ),
+                patch("acn_deepswe.presmoke_cli._ensure_frozen_task_images_available"),
+            ):
+                observed = preflight_execution(config)
+
+        self.assertEqual(observed, docker_root)
+        cleanup.assert_called_once_with({config.pier_egress_proxy_image})
+
+    def test_preflight_rejects_proxy_image_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(
+                load_config(write_fixture(Path(directory))),
+                cleanup_stale_pier_resources=True,
+            )
+            with (
+                patch("acn_deepswe.presmoke_cli.verify_pier_executable_binding"),
+                patch(
+                    "acn_deepswe.presmoke_cli._run_preflight_command",
+                    return_value=type("Completed", (), {"returncode": 0})(),
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.cleanup_stale_pier_resources",
+                    return_value=CleanupSummary(0, 0),
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "2" * 64,
+                ),
+                self.assertRaisesRegex(PresmokeCliError, "content digest 不匹配"),
+            ):
+                preflight_execution(config)
+
+    def test_progress_defaults_are_loaded_and_stall_threshold_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            config = load_config(config_path)
+            self.assertEqual(config.progress, {"poll_secs": 30, "stall_after_secs": 600})
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["progress"] = {"poll_secs": 60, "stall_after_secs": 30}
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "stall_after_secs"):
+                load_config(config_path)
+
+    def test_rejects_removed_root_tool_loop_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = write_fixture(Path(directory))
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw["resources"]["max_tool_loop_turns"] = 32
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(PresmokeCliError, "max_tool_loop_turns"):
+                load_config(config_path)
+
+    def test_rejects_relative_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory), output_dir="relative-output")
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--config", str(config), "--dry-run"])
+        self.assertNotEqual(raised.exception.code, 0)
+
+    def test_constructs_presmoke_runner_and_executes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            fake_runner = _FakeRunner()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.PresmokeHostRunner", return_value=fake_runner
+                ) as runner,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+            ):
+                result = main(["--config", str(config)])
+        self.assertEqual(result, 0)
+        runner.assert_called_once()
+        specs = runner.call_args.args[0]
+        self.assertEqual(tuple(spec.task_id for spec in specs), TASK_IDS)
+        self.assertEqual(fake_runner.calls, [True])
+
+    def test_resume_validates_only_pending_specs_after_relocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            completed_result = PresmokeTaskResult(
+                TASK_IDS[0],
+                "passed",
+                str(Path(directory) / "completed-manifest.json"),
+                None,
+            )
+            fake_runner = _FakeRunner()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.load_terminal_task_results",
+                    return_value=(completed_result,),
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.validate_b_only_sources"
+                ) as validate_sources,
+                patch(
+                    "acn_deepswe.presmoke_cli.PresmokeHostRunner",
+                    return_value=fake_runner,
+                ) as runner,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+            ):
+                result = main(["--config", str(config), "--resume"])
+
+        self.assertEqual(result, 0)
+        validate_sources.assert_called_once()
+        validated_specs = validate_sources.call_args.args[0]
+        self.assertEqual(
+            tuple(spec.task_id for spec in validated_specs),
+            TASK_IDS[1:],
+        )
+        self.assertTrue(
+            all(
+                spec.manifest_path.is_relative_to(
+                    Path(directory) / "output" / "resumes" / "resume-001" / "tasks"
+                )
+                for spec in validated_specs
+            )
+        )
+        runner.assert_called_once()
+        self.assertEqual(runner.call_args.args[0], validated_specs)
+        self.assertEqual(fake_runner.calls, [True])
+
+    def test_resume_rejects_a_recorded_gate_or_protocol_failure_without_starting_tasks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            failure = PresmokeTaskResult(
+                TASK_IDS[0], "failed", str(Path(directory) / "failed-manifest.json"), "GATE_FAILED"
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "acn_deepswe.presmoke_cli.load_terminal_task_results", return_value=(failure,)
+                ),
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner") as runner,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--config", str(config), "--resume"])
+
+        self.assertNotEqual(raised.exception.code, 0)
+        runner.assert_not_called()
+
+    def test_existing_upstream_key_takes_priority_over_stdin_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            existing_key = "existing-test-secret"
+            fake_runner = _FakeRunner()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": existing_key,
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch("acn_deepswe.presmoke_cli.getpass.getpass") as read_key,
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner", return_value=fake_runner),
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+            ):
+                result = main(["--config", str(config), "--read-key-stdin"])
+                self.assertEqual(os.environ.get("ACN_EVAL_UPSTREAM_KEY"), existing_key)
+        self.assertEqual(result, 0)
+        read_key.assert_not_called()
+
+    def test_read_key_stdin_injects_only_for_execution_and_clears_afterward(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            secret = "stdin-test-secret"
+            fake_runner = _FakeRunner()
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid"},
+                    clear=True,
+                ),
+                patch("acn_deepswe.presmoke_cli.getpass.getpass", return_value=secret) as read_key,
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner", return_value=fake_runner),
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch("acn_deepswe.presmoke_cli._verify_acn_eval_build_info"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=successful_preflight_commands(config.parent),
+                ),
+                patch("sys.stdout") as stdout,
+                patch("sys.stderr") as stderr,
+            ):
+                result = main(["--config", str(config), "--read-key-stdin"])
+        self.assertEqual(result, 0)
+        read_key.assert_called_once()
+        self.assertEqual(fake_runner.calls, [True])
+        self.assertEqual(fake_runner.upstream_key_during_run, secret)
+        self.assertNotIn("ACN_EVAL_UPSTREAM_KEY", os.environ)
+        rendered = "".join(
+            str(call.args[0]) for stream in (stdout, stderr) for call in stream.write.call_args_list
+        )
+        self.assertNotIn(secret, rendered)
+
+    def test_read_key_stdin_rejects_empty_value_without_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            secret = "empty-stdin-test-secret"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid"},
+                    clear=True,
+                ),
+                patch("acn_deepswe.presmoke_cli.getpass.getpass", return_value="") as read_key,
+                patch("sys.stderr") as stderr,
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner") as runner,
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--config", str(config), "--read-key-stdin"])
+        self.assertNotEqual(raised.exception.code, 0)
+        read_key.assert_called_once()
+        runner.assert_not_called()
+        rendered = "".join(str(call.args[0]) for call in stderr.write.call_args_list)
+        self.assertNotIn(secret, rendered)
+
+    def test_dry_run_never_reads_key_from_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid"},
+                    clear=True,
+                ),
+                patch("acn_deepswe.presmoke_cli.getpass.getpass") as read_key,
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+            ):
+                result = main(["--config", str(config), "--dry-run", "--read-key-stdin"])
+        self.assertEqual(result, 0)
+        read_key.assert_not_called()
+
+    def test_preflight_rejects_insufficient_docker_resources_before_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_fixture(Path(directory))
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ACN_EVAL_UPSTREAM_KEY": "test-key",
+                        "ACN_EVAL_UPSTREAM_BASE_URL": "https://upstream.invalid",
+                    },
+                    clear=True,
+                ),
+                patch("acn_deepswe.presmoke_cli.verify_acn_revision"),
+                patch("acn_deepswe.presmoke_cli.verify_checkout_revision"),
+                patch(
+                    "acn_deepswe.presmoke_cli._docker_image_content_digest",
+                    return_value="sha256:" + "1" * 64,
+                ),
+                patch("acn_deepswe.presmoke_cli.os.access", return_value=True),
+                patch(
+                    "acn_deepswe.presmoke_cli.subprocess.run",
+                    side_effect=insufficient_resource_commands(config.parent),
+                ),
+                patch("acn_deepswe.presmoke_cli.PresmokeHostRunner") as runner,
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--config", str(config)])
+        self.assertNotEqual(raised.exception.code, 0)
+        runner.assert_not_called()
+
+    def test_preflight_pulls_each_missing_task_image_once_before_freezing_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(write_fixture(Path(directory)))
+            missing = completed(["docker", "image", "inspect"], returncode=1)
+            pulled = completed(["docker", "pull"])
+            digest = completed(["docker", "image", "inspect"], stdout="sha256:" + "d" * 64)
+            with patch(
+                "acn_deepswe.presmoke_cli.subprocess.run", side_effect=[missing, pulled, digest]
+            ) as run:
+                _ensure_frozen_task_images_available(config, config.output_dir.parent)
+
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[1].args[0], ["docker", "pull", "registry.example/task:1"]
+        )
+
+
+class _FakeRunner:
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+        self.upstream_key_during_run: str | None = None
+
+    def run(self, *, execute: bool) -> tuple[object, ...]:
+        self.calls.append(execute)
+        self.upstream_key_during_run = os.environ.get("ACN_EVAL_UPSTREAM_KEY")
+        return ()
+
+
+def write_fixture(root: Path, *, output_dir: str | None = None) -> Path:
+    normalized = root / "normalized"
+    source = root / "source-tasks"
+    for task_id in TASK_IDS:
+        for task_root in (normalized / task_id, source / task_id):
+            (task_root / "environment").mkdir(parents=True)
+            (task_root / "tests").mkdir()
+            (task_root / "task.toml").write_text(
+                '[environment]\ndocker_image = "registry.example/task:1"\n', encoding="utf-8"
+            )
+        (normalized / task_id / "instruction.md").write_text(task_id, encoding="utf-8")
+    acn_eval = root / "acn_eval"
+    acn_eval.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--build-info-json" ]; then\n'
+        "  printf '%s\\n' "
+        '\'{"version":"0.2.5","commit":"acn-rev",'
+        '"commit_timestamp":"2026-08-28T00:00:00Z"}\'\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    acn_eval.chmod(0o755)
+    pier_checkout, pier = write_pier_venv(root)
+    skill = root / "coding-benchmark"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("skill", encoding="utf-8")
+    manifest = {
+        "schema_version": 1,
+        "algorithm": "random.sample_without_replacement_v1",
+        "seed": 20260726,
+        "candidates_hash": "a" * 64,
+        "deepswe_revision": "deepswe-rev",
+        "pier_revision": "pier-rev",
+        "task_ids": list(TASK_IDS),
+        "task_directory_hash_algorithm": TASK_DIRECTORY_HASH_ALGORITHM,
+        "task_toml_hashes": {
+            task_id: {
+                "source": digest(source / task_id / "task.toml"),
+                "normalized": digest(normalized / task_id / "task.toml"),
+            }
+            for task_id in TASK_IDS
+        },
+        "task_directory_hashes": {
+            task_id: {
+                "source": sha256_directory_tree(source / task_id),
+                "normalized": sha256_directory_tree(normalized / task_id),
+            }
+            for task_id in TASK_IDS
+        },
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    attempts = []
+    for task_id in TASK_IDS:
+        for variant in ("A", "B_empty", "B_claim", "B_forced_claim"):
+            base = root / "attempts" / f"{task_id}-{variant}"
+            attempts.append(
+                {
+                    "schema_version": 1,
+                    "attempt_id": f"{task_id}-{variant}",
+                    "task_id": task_id,
+                    "variant": variant,
+                    "output_path": str(base / "output"),
+                }
+            )
+    (root / "attempt-plan.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "freeze_candidates_hash": "a" * 64,
+                "seed": 20260726,
+                "attempts": attempts,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = {
+        "frozen_manifest": str(manifest_path),
+        "attempt_plan": str(root / "attempt-plan.json"),
+        "deepswe_checkout": str(root / "deepswe"),
+        "acn_checkout": str(root / "acn"),
+        "source_tasks_root": str(source),
+        "pier_checkout": str(pier_checkout),
+        "pier_executable": str(pier),
+        "pier_egress_proxy_image": "pier-egress-proxy:ubuntu-24.04",
+        "pier_egress_proxy_content_digest": "sha256:" + "1" * 64,
+        "acn_eval": str(acn_eval),
+        "frozen_skill": str(skill),
+        "normalized_root": str(normalized),
+        "output_dir": output_dir or str(root / "output"),
+        "model": "fixture-model",
+        "response_model": "fixture-checkpoint",
+        "reasoning_effort": "max",
+        "run_class": "diagnostic",
+        "acn_main_revision": "9b818d70ddfad2f7d5e1972577dd294b19481c92",
+        "acn_version": "0.2.5",
+        "file_edit_authority_enabled": True,
+        "acn_revision": "acn-rev",
+        "resources": {
+            "cpus": 2,
+            "memory_mb": 4096,
+            "storage_mb": 1024,
+            "max_tokens": 128,
+            "context_window": 256,
+        },
+        "timeouts": {
+            "agent_seconds": 60,
+            "deadline_reserve_seconds": 30,
+            "verifier_seconds": 60,
+        },
+        "llm_retry": {"retry_count": 3, "retry_base_delay_ms": 1000, "retry_max_delay_ms": 30000},
+        "progress": {"poll_secs": 30, "stall_after_secs": 600},
+        "host_capacity": {
+            "memory_reserve_mb": 1,
+            "disk_reserve_mb": 1,
+            "disk_admission_mb_per_worker": 1,
+        },
+    }
+    path = root / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_pier_venv(root: Path) -> tuple[Path, Path]:
+    checkout = root / "pier-checkout"
+    checkout.mkdir()
+    package = checkout / "src" / "pier"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__version__ = 'fixture'\n", encoding="utf-8")
+    bin_dir = root / "pier-venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    python = bin_dir / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+    python3 = bin_dir / "python3"
+    python3.symlink_to("python")
+    executable = bin_dir / "pier"
+    executable.write_text(f"#!{python3}\n", encoding="utf-8")
+    executable.chmod(0o755)
+    return checkout, executable
+
+
+def pier_install_evidence(checkout: Path, *, version: str = "0.3.0") -> dict[str, str]:
+    return {
+        "version": version,
+        "direct_url": json.dumps({"url": checkout.as_uri(), "dir_info": {"editable": True}}),
+    }
+
+
+def successful_preflight_commands(root: Path) -> list[object]:
+    return [
+        completed(["python"], stdout=json.dumps(pier_install_evidence(root / "pier-checkout"))),
+        completed(["pier", "--help"]),
+        completed(["docker", "ps", "-q"]),
+        completed(
+            ["docker", "info", "--format", "{{json .}}"],
+            stdout=json.dumps(
+                {
+                    "NCPU": 8,
+                    "MemTotal": 4 * 4096 * 1024 * 1024,
+                    "DockerRootDir": str(root),
+                }
+            ),
+        ),
+        *[
+            completed(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{.Id}}",
+                    "registry.example/task:1",
+                ],
+                stdout="sha256:" + "d" * 64,
+            )
+            for _ in range(len(TASK_IDS) + 1)
+        ],
+    ]
+
+
+def insufficient_resource_commands(root: Path) -> list[object]:
+    return [
+        completed(["python"], stdout=json.dumps(pier_install_evidence(root / "pier-checkout"))),
+        completed(["pier", "--help"]),
+        completed(["docker", "ps", "-q"]),
+        completed(
+            ["docker", "info", "--format", "{{json .}}"],
+            stdout=json.dumps(
+                {
+                    "NCPU": 1,
+                    "MemTotal": 2048 * 1024 * 1024,
+                    "DockerRootDir": str(root),
+                }
+            ),
+        ),
+    ]
+
+
+def completed(command: list[str], *, stdout: str = "", returncode: int = 0) -> object:
+    from subprocess import CompletedProcess
+
+    return CompletedProcess(command, returncode, stdout=stdout, stderr="")
