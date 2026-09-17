@@ -72,7 +72,7 @@ ACN 主实验在同一模型上的位置（Pier 通过，111 题，单次运行�
 | 项目 | 取值 |
 | --- | --- |
 | 基准 | DeepSWE v1.1，冻结 113 题 |
-| 模型 | 主实验 DeepSeek-V4.1-Flash；Standard 全量运行 DeepSeek-V4-Flash；其余轮次以各自冻结记录为准 |
+| 模型 | 主实验为 DeepSeek-V4.1-Flash；其余所有运行（Standard 全量、Bash 对齐、Pi-like 消融与附录各轮）均为 DeepSeek-V4-Flash |
 | 采样 | `temperature=1.0`，`top_p=0.95`，`reasoning_effort=max`，上下文 1,000,000 token |
 | 资源 | 每次运行 2 CPU / 16 GiB 内存 / 20 GiB 存储，20 路并行 |
 | 运行时 | ACN 评测二进制 + Pier 容器与官方 verifier |
@@ -187,7 +187,7 @@ ACN 默认只把通过 verifier 的 producer claim 送进检索，失败经验�
 ### 2.2 与 mini-swe-agent 同场
 
 让 ACN 只通过 shell 读写文件与运行测试，对齐 [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)
-（DeepSWE 官方榜单 harness）仅暴露 Bash 的条件，与其两次运行对照。分母 113，严格通过。
+（DeepSWE 官方榜单 harness）仅暴露 Bash 的条件，与其两次运行对照。模型 DeepSeek-V4-Flash，分母 113，严格通过。
 
 | 运行 | 通过 | 相对 ACN | exact McNemar p |
 | --- | ---: | ---: | ---: |
@@ -201,7 +201,7 @@ ACN 113 题全部形成有效结果，0 次运行异常、0 个空 patch。相�
 
 ### 2.3 Pi-like：通过率持平，交互更省
 
-固定 30 题、四种 harness 模式、各 3 次重复，只跑 producer 臂，共 90 题次。
+固定 30 题、四种 harness 模式、各 3 次重复，只跑 producer 臂，共 90 题次。模型 DeepSeek-V4-Flash。
 
 | Harness | 通过 | 请求 | 输入 token | 相对 Standard |
 | --- | ---: | ---: | ---: | --- |
@@ -232,6 +232,8 @@ Concise 反而请求更多、通过更少：收益来自工具面与上下文策
 - ACN 与横向坐标里的外部 harness 成绩是同口径可排名的。
 
 ## 附录 A. 其他已闭环的全量运行
+
+本附录各轮均使用 DeepSeek-V4-Flash。
 
 ### A.1 2026-08-30 Standard · claim 交付优化
 
