@@ -1,276 +1,243 @@
-# ACN DeepSWE 评测
+# ACN on DeepSWE: Coding Harness and Claim Reuse
 
-[English](README_EN.md)
+[评测 Runner](docs/runner.md) · [English runner](README_EN.md)
 
-本仓库是 [Agent Claim Network（ACN）](https://github.com/FTShare-Lab/agent-claim-network) 在
-[DeepSWE](https://deepswe.datacurve.ai/) 上的可审计评测 runner。它在冻结的 DeepSWE / Pier revision 上，
-为每道题运行 ACN 的四个臂，用 DeepSWE 官方 program verifier 判卷，并把任务冻结、模型访问、claim 隔离、
-用量计量与结果归因的每一步都落成可重建的证据。
+Agent Claim Network（ACN）在 DeepSWE v1.1 上的评测报告。正文只展开对 **ACN coding harness** 和 **claim 复用** 有利、且已经闭环的结果；其余成熟对照放在附录。中断、未齐分母、以及样本过小的诊断轮次不进入本页成绩。
 
-DeepSWE v1.1 由 [Datacurve](https://github.com/datacurve-ai/deep-swe) 维护：113 个从活跃开源仓库
-新写的长程软件工程任务，覆盖 91 个仓库、5 种语言，每题在隔离容器中运行，由手写的行为级 verifier
-判定 patch 是否通过；官方用 [Pier](https://github.com/datacurve-ai/pier) 执行任务并统一以
-mini-swe-agent 跑榜。本 runner 复用 Pier 的任务格式、容器隔离、网络 allowlist 与 verifier，只把
-agent 换成 ACN。
+更新日期：2026-09-17。
 
-评测回答两个问题：ACN 在无 claim 状态下的 DeepSWE 得分、token 与 agent step 大致处于什么位置；同一
-模型、同一批任务下，第二个全新 agent 通过 router 获得前一个 agent 冻结的 claim 后，是否优于无 claim
-的全新 agent。方法学口径见 [docs/methodology.md](docs/methodology.md)，结果见
-[docs/results.md](docs/results.md)（待更新）。
+## Introduction
 
-## 四臂设计
+ACN 是终端里的通用领域助手：单人模式下完成多轮会话、文件与命令、Memory 与本地 claim；接入 Router / Maintainer 后，可检索的判断以 claim 形式在 fresh workspace 之间复用。评测关心两件事：
 
-每道题先运行 `A` 与 `B_empty`，`A` 完成后由宿主写入不可变 freeze barrier 并冻结 claim bundle，再从
-pristine 工作区运行两个带 claim 的 B 臂：
+1. **Harness**：ACN 作为 coding agent，在 DeepSWE 上能不能稳定解题。
+2. **Claim**：已验证的解题经验，能不能在四臂对照里提高通过率，并降低模型交互成本。
 
-| Arm | 作用 | claim 如何到达模型 |
-| --- | --- | --- |
-| `A` | producer；独立解题并产出可冻结的 claim | 无前序 claim |
-| `B_empty` | 无 claim 的同题基线 | 完全没有 claim |
-| `B_claim` | 自主检索的真实端到端路径 | 冻结 router 可用，system context 只展示有界摘要目录；是否调用 `consult_router` 取回正文由模型决定 |
-| `B_forced_claim` | 受控对照 | 框架按 bundle 查冻结 router，把同一批 claim 附到首轮任务上下文 |
+本页所有「通过」若未另写，分为两种口径：
 
-主比较是 `B_claim` 与 `B_forced_claim` 分别相对 `B_empty` 的同题配对差。B 臂不能看到 A 的 patch、
-工作区、session、日志或私有 memory；除 claim 交付方式外，四臂的 system prompt、skill、工具、预算与
-verifier 完全相同。默认 `claim_quality_gate=verified_producer_only`：producer 未通过 verifier 时其
-claim 全部隔离，两个带 claim 的 B 臂拿到空 bundle 并记录 `EMPTY_CLAIM_BUNDLE`，不伪造或借用其他题的
-claim。
+- **Verifier 严格通过**：`verifier_passed=true`，对应官方 Gate 齐且 rust 侧记过。
+- **Pier 通过**：`pier_trial.verifier_rewards.reward = 1`，对应 Pier 测试全部通过。后者覆盖「测试已过、rust 证据未齐」的情况，适合看解题本身；前者更严，适合看正式闭环。
 
-## 与官方口径的关系
+四臂含义固定：
 
-- **模型访问**沿用 Pier 官方 adapter 的做法，不自建代理或 broker。模型 key 从宿主环境变量
-  `ACN_EVAL_UPSTREAM_KEY` 读取，仅以容器变量 `ACN_EVAL_MODEL_KEY` 交给 `acn_eval`；进程启动后经匿名
-  pipe 原位 re-exec 清除初始环境，key 不进 argv、配置文件、manifest 或 JSONL。
-- **出网**由 Pier 的 Squid 域名 allowlist 限死，只允许 `ACN_EVAL_UPSTREAM_BASE_URL` 的主机名；agent 与
-  verifier 的 `allow_internet` 均为 `false`；`code_run` 子进程会剥掉 key 变量。
-  `model_egress_mode` 是冻结启动配置的一部分，默认且唯一可作为正式结果的值是 `"pier"`；`"direct"`
-  仅供诊断模型连通性，会被 manifest 记录并使 formal Gate 失败。
-- **用量**由 `acn_eval` 从上游响应的 `usage` 累计写入 `result.json`，宿主另算 `cache_hit_rate`。
-  reasoning token 计入 `max_tokens`；官方 mini-swe-agent 不设 output cap，本 runner 默认 65536。
-- **完成语义**：evaluation profile 暴露无参数的 `submit_task`，模型完成实现、测试与 diff 检查后应把它
-  作为唯一工具调用；提交后不再请求模型，随后运行 session finalize 与 Pier verifier。正常最终回复遗漏
-  该调用时记录 `implicit_assistant_done` 并走同一路径；截断、异常、无可消费输出和 deadline 仍为 agent
-  failure。
-- **资源与超时**：官方对齐组为 2 CPU / 8 GiB / 20 GiB、agent 5400 秒、verifier 1800 秒；ACN 工作
-  deadline 预留 120 秒收尾。任何扩展预算都只能标为 diagnostic。
-
-四臂并非官方单 agent 榜单的直接复刻，不得把本 runner 的结果与外部公布分数当作同口径排行榜比较。
-
-## 仓库结构
-
-```
-src/acn_deepswe/        runner 源码（仅标准库；datacurve-pier 为真实执行的 optional dependency）
-  dataset.py            任务冻结与 tree hash
-  network.py            DeepSWE network_mode → Pier allow_internet 的 fail-closed 转换
-  plan.py               确定性 attempt plan
-  provenance.py         不可变 provenance 与目录 tree hash 算法
-  pier_adapter.py       Pier BaseAgent 适配：上传、allowlist、模型出口、单 attempt 执行
-  host_runner.py        单题四臂宿主编排：producer wave → freeze → consumer wave
-  claim_freeze.py       基于 freeze barrier 的 claim bundle 冻结
-  gate.py               机器可判定的基础设施 / 归因 / 隔离门禁
-  rust_contract.py      Rust acn_eval 产物（result.json / events.jsonl）的定版解析
-  presmoke.py           多题调度与 aggregate（配对、分层、claim funnel）
-  presmoke_cli.py       acn-deepswe-presmoke：按冻结 manifest 启动、dry-run、续跑
-  auto_run.py           acn-deepswe-auto：prepare / run / monitor 自动化编排
-  cli.py                acn-deepswe：freeze / plan / validate-config 等审计型命令
-  resource_guard.py     Docker 全局互斥、容量门禁与遗留清理
-tests/                  unittest 套件与 Rust 契约 fixture
-manifests/              示例启动配置（*.example.json）与历史冻结 manifest
-assets/coding-benchmark 四臂共同注入的冻结 skill
-docker/                 交叉编译 Linux x86_64 acn_eval 的 builder
-docs/                   方法、运行指南、契约与结果
-```
-
-## 快速开始
-
-### 依赖
-
-- Python 3.12+；Docker daemon（Linux amd64 或 arm64 宿主均可，macOS Docker Desktop 亦可）。
-- DeepSWE checkout 与 Pier checkout，均处于冻结 revision 且工作树干净。Pier 以 editable 方式安装进
-  自己的 venv，`pier_executable` 必须是该 venv 的 `bin/pier`，其 PEP 610 `direct_url` 须指向
-  frozen Pier checkout。
-- ACN checkout（构建 `acn_eval` 的源码，见 [docs/acn_integration.md](docs/acn_integration.md)）。
-
-### 安装 runner
-
-```sh
-git clone https://github.com/FTShare-Lab/acn-deepswe-eval
-cd acn-deepswe-eval
-uv venv .venv --python 3.12
-uv pip install --python .venv/bin/python -e .
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
-```
-
-### 构建 Linux `acn_eval`
-
-```sh
-sh docker/build-acn-eval-amd64.sh --acn-checkout /absolute/path/to/agent-claim-network
-```
-
-产物固定为 Linux x86_64 ELF，位于 `<acn_checkout>/target/deepswe-linux-amd64/release/acn_eval`。
-
-### 冻结任务
-
-```sh
-acn-deepswe validate-config /absolute/DeepSWE/tasks/<task> /absolute/checked
-acn-deepswe freeze-execution-dataset /absolute/DeepSWE/tasks \
-  /absolute/runs/current/frozen-manifest.json /absolute/runs/current/normalized \
-  --deepswe-checkout /absolute/DeepSWE --pier-checkout /absolute/pier \
-  --seed 17 --sample-size 30
-acn-deepswe plan /absolute/runs/current/frozen-manifest.json /absolute/runs/current --seed 99
-```
-
-`validate-config` 做 fail-closed 网络转换：只有 `agent.network_mode` 与 `verifier.network_mode` 均为
-`"no-network"` 时才生成 Pier 兼容副本，并对两个环境写入 `allow_internet = false`；转换保留
-`[[verifier.collect]]`，源与结果的 SHA-256 一并输出。`freeze-execution-dataset` 在写入前确认两个
-checkout 的精确 revision 与干净工作树，批量生成离线任务副本并冻结每题 TOML 与目录 tree hash；已有
-manifest 或 normalized 目录时拒绝覆盖。`--sample-size 5` 用于 Pre-smoke，`30` 用于 Smoke，`113` 为
-全量；抽样始终是稳定排序、固定 seed 的无放回选择。`plan` 从冻结 manifest 生成四臂 attempt plan。
-
-### 启动配置与 dry-run
-
-复制 [manifests/presmoke-run.example.json](manifests/presmoke-run.example.json) 到仓库外的绝对路径，
-填入两份 checkout、`acn_checkout`、Linux `acn_eval`、本仓库的 `assets/coding-benchmark`、冻结模型名与
-资源预算。**配置中不得放 credential**；它只从宿主环境读取。示例中的 `frozen-model-alias` /
-`frozen-model-checkpoint` 是占位值。
-
-```sh
-ACN_EVAL_UPSTREAM_BASE_URL=<https-url> \
-acn-deepswe-presmoke --config /absolute/path/to/presmoke-run.json --dry-run
-```
-
-dry-run 静态校验两份 checkout revision、`acn_checkout` 与 `acn_revision` 的绑定、source/normalized
-完整 task 目录 tree hash 和全部四臂计划，不执行 Linux 二进制，也不调用 Docker。
-
-### 真实执行
-
-```sh
-ACN_EVAL_UPSTREAM_BASE_URL=<https-url> ACN_EVAL_UPSTREAM_KEY=<key> \
-acn-deepswe-presmoke --config /absolute/path/to/presmoke-run.json
-```
-
-不希望把 key 写进 shell 历史时用 `--read-key-stdin` 按提示隐藏输入；它只在真实执行且环境无该变量时
-读取，进程退出时清除。真实执行在创建任何 attempt 目录前硬性检查：Pier 可执行文件与 checkout 的绑定、
-`pier --help`、Docker daemon、每个 task 镜像能解析为本地 content digest、Pier egress proxy 镜像
-digest 一致，以及 Docker 的 `NCPU` / `MemTotal` 足以容纳 `task_workers × cpus` 与
-`task_workers × memory_mb`。资源不足直接失败，不静默降低并发。
-
-preflight 通过后，runner 把 `acn_deepswe`、Pier package、console script、coding skill 与 `acn_eval`
-一次性复制到 `output_dir/frozen-python/`（只读），四臂只从该目录 import，并在每臂前复核二进制、skill、
-task 与两份 Python source tree hash。冻结 manifest 中的每题按 producer / consumer 两波执行，波内可
-并行；全部题目和 arm 共用 `task_workers` 个 attempt 许可，Pier trial `max_retries=0`。基础设施或 Gate
-失败以非零退出，但不会自动重试 solve。
-
-Pier 固定 `force_build=false`（使用冻结 `task.toml` 指向的官方预构建镜像）与 `delete=false`（trial
-结束拆掉 Compose 容器但保留本地镜像），`n_attempts=1`、`n_concurrent_trials=1`。
-
-### 自动化与监控
-
-Smoke 后补齐全量、直接全量、先 A 后 B 的两阶段、adaptive producer 选择与只读监控由
-`acn-deepswe-auto` 承载，见 [docs/automated_run.md](docs/automated_run.md) 与
-[docs/solver_aligned_run.md](docs/solver_aligned_run.md)。比较两个 ACN revision 的配对实验见
-[docs/claim_harness_experiment.md](docs/claim_harness_experiment.md)。
-
-## 启动配置参考
-
-`acn-deepswe-presmoke` 的配置字段（未列出的字段会被拒绝）：
-
-| 字段 | 说明 |
+| 臂 | 角色 |
 | --- | --- |
-| `frozen_manifest` / `attempt_plan` / `normalized_root` / `output_dir` | 冻结 manifest、attempt plan、离线任务副本与宿主输出目录，均为绝对路径 |
-| `deepswe_checkout` / `source_tasks_root` / `pier_checkout` / `pier_executable` | 冻结的 DeepSWE、任务根目录、Pier checkout 与其 venv 的 `bin/pier` |
-| `acn_checkout` / `acn_eval` | 构建 `acn_eval` 的 ACN checkout（HEAD 必须等于 `acn_revision` 且干净）与 Linux 二进制 |
-| `acn_revision` / `acn_main_revision` / `acn_version` | 评测 commit、产品基线 commit 与版本；`formal` 固定锚定 `9b818d70…` / `0.2.5` |
-| `frozen_skill` | 含 `SKILL.md` 的完整 skill 目录，四臂注入相同内容，hash 写入 manifest |
-| `pier_egress_proxy_image` / `pier_egress_proxy_content_digest` | Pier Squid 代理镜像及其 content digest；`formal` 固定 `pier-egress-proxy:ubuntu-24.04` |
-| `model` / `response_model` / `reasoning_effort` | 请求模型名、上游实际回显的 checkpoint、推理强度 |
-| `run_class` | `formal` 或 `diagnostic` |
-| `model_egress_mode` | `pier`（正式）或 `direct`（诊断） |
-| `harness_mode` | `standard`（默认）、`minimal`、`concise`、`pi_like`、`open_code_like`；非 standard 仅用于机制对照 |
-| `claim_quality_gate` | `verified_producer_only`（默认）或 `none` |
-| `file_edit_authority_enabled` | 是否启用 ACN 的文件修改许可校验 |
-| `resources` | `cpus`、`memory_mb`、`storage_mb`、`max_tokens`、`context_window` |
-| `timeouts` | `agent_seconds`、`deadline_reserve_seconds`、`verifier_seconds`；`agent_seconds` 同时覆盖 Pier 墙钟、ACN 请求 timeout 与 attempt deadline |
-| `llm_retry` | `retry_count`、`retry_base_delay_ms`、`retry_max_delay_ms` |
-| `progress` | `poll_secs`（默认 30）、`stall_after_secs`（默认 600）；只标记疑似停滞，绝不自动终止 |
-| `host_capacity` | `memory_reserve_mb`、`disk_reserve_mb`、`disk_admission_mb_per_worker`（`formal` 不小于 8192） |
-| `task_workers` | 全局并发 attempt 许可，默认 1 |
-| `cleanup_stale_pier_resources` | 启动前清理已停止且带 Pier Compose 证据的遗留容器及其生成镜像，并核对 egress proxy 镜像 digest |
-| `run_all_variants_without_claims` | 无 eligible claim 时仍执行两个带 claim 的 B 臂并标记空 bundle |
-| `run_a_only` / `b_only_from_a_output_dir` | 先 A 后 B 的两阶段接续 |
-| `claim_producer_variant` / `producer_pair_only` / `adaptive_source_output_dir` / `producer_selection_manifest` | `A`（默认）或 `adaptive` 两阶段 producer 选择 |
+| A | producer，先解题并决定是否沉淀 claim |
+| `B_empty` | 无 claim 的消费者基线 |
+| `B_claim` | 按需检索 claim |
+| `B_forced_claim` | 强制注入同一批可引用 claim |
 
-`acn-deepswe-auto` 在此基础上以 `run_root`、`smoke_size`、`full_size`、`dataset_seed`、
-`smoke_plan_seed`、`full_plan_seed`、`adaptive_producer_selection`、
-`reuse_local_agent_image_fingerprint` 替代由它生成的 manifest / plan / 输出路径与 `acn_revision`。
+## Headline Results
 
-## 产物
+**Harness。** 一次完整 Standard Full-113 上，A 为 **54/113（47.79%）**，`B_empty` 为 **52/113（46.02%）**。Bash-parity 全量 113 题 ACN 为 **52/113**，与 MiniSWE 的 59/113、54/113 同题配对没有稳定系统性差距；113 题全部进入 verifier，没有空 patch。
 
-每个 attempt 的 `output_path` 下：`host-config/`（attempt TOML、ACN config、Pier job 与 trial）、
-`gate.json`、`attempt-result.json`、`progress.json`。Pier trial 下的
-`agent/evaluation/{result.json,events.jsonl}`、`artifacts/model.patch` 与 pinned `TrialResult` 会被
-引用并解析。attempt TOML 固定 `workspace_root=/app`、`runtime_root=/logs/agent/runtime`、
-`output_dir=/logs/agent/evaluation`、`acn_config=/opt/acn-eval/acn.toml`；`B_claim` 与
-`B_forced_claim` 设置 `claim_bundle=/opt/acn-eval/claims.json`。
+**Claim（r8）。** `verified_producer_only` 四臂对照，111 题，Pier 通过。按需 claim 相对无 claim：
 
-`attempt-result.json` 记录 `status`、`verifier_passed`、`agent_steps`、`usage`、`gate`、`pier_trial`、
-`verifier_regrade`、`failure_kind` 与带 `stage=` 前缀的 `agent_error`。`verifier_passed` 只有 agent
-正常完成且 verifier 通过才为 true；若 Rust result 标记 `failure_kind=upstream_concurrency_exhausted`
-（HTTP 429 且上游给出并发容量耗尽代码），宿主记为基础设施失败，保留证据但不执行 Gate、freeze 或后续
-B 臂。
+| 指标 | `B_empty` | `B_claim` | 变化 |
+| --- | ---: | ---: | ---: |
+| Pier 通过 | 63/111（56.76%） | **73/111（65.77%）** | **+10 题** |
+| 输入 token | 2,290,656,202 | **1,927,317,486** | **−15.9%** |
+| 模型请求 | 13,532 | **12,141** | **−10.3%** |
+| 输出 token | 19,728,252 | **19,002,375** | **−3.7%** |
 
-`progress.json` 每 `poll_secs` 原子写入 session 事件路径、事件数、最后活动时间与最近事件类型；连续
-`stall_after_secs` 无事件标记 `possibly_stalled`，仅提示人工排查。人为中止记录
-`INTERRUPTED_BY_OPERATOR`。
+claim 被判定 `used` 的 46 题上，通过为 **39/46 vs 30/46**。
 
-`output_dir/presmoke-aggregate.json` 汇总全部 task：`cohort_coverage`（planned / included / excluded 与
-排除原因，分母固定为冻结 task 集）、按 producer 结果分层的 `cohort_metrics`（各臂通过数、用量总和 /
-均值、`empty_claim_bundle_attempts`）、两组同题配对 `paired_against_producer` 与
-`paired_against_no_claim_baseline`（含 wins / losses 与双侧精确二项检验 `exact_mcnemar_p`），以及
-`claim_funnel`（每臂 bundle 可用、router 检索、内容注入、模型报告使用及对应 claim 数）。各题
-manifest、jobs 与 claim bundle 在 `output_dir/tasks/<task>/`；`task-completions.json` 持久化所有 task
-终态。
+**效率。** 30 题 × 3 次重复的 Pi-like 消融中，通过率与 Standard 接近（47/90 对 46/90），请求 −6.9%，输入 token −15.3%，三次重复请求均下降。
 
-## Gate 判什么
+这些数字支持三句可以对外说的话：ACN 能在 DeepSWE 上作为有效 coding harness 运行；r8 里按需 claim 同时提高通过率并降低交互成本；工具面收敛可以在不牺牲通过率的前提下减少请求。它们**不支持**「任意 claim 都能抬升成绩」或「Pi-like 已在 Full-113 上优于 Standard」。
 
-Gate 只验证基础设施、claim 归因与隔离：artifact hash、verifier 是否真的跑过、usage 是否完整上报、
-响应模型名是否等于 `response_model`、Pier task checksum / trial 隔离，以及 `B_empty` 不得见到任何
-claim、带 claim 的两个 B 臂只能使用冻结 bundle 内的 claim（候选 ⊇ 选中 ⊇ 注入 ⊇ 使用，内容 hash 一致）。
+## Evaluation Setup
 
-**verifier 判 0 分与 agent 自身失败都是有效实验结果，不是 Gate 失败**，按未通过计分，不得重跑刷分。
-checkpoint 持久化所有 task 终态；普通 `--resume` 遇到任何失败终态即拒绝。只有无终态且已有半成品的
-中断 task，才可由操作者显式传 `--resume --retry-interrupted` 重跑一次，此前的产物和 retry 计数都会
-保留。
+共同协议（各表若有偏差会单列）：
 
-## 结果
+- 基准：DeepSWE v1.1，冻结 113 题候选集
+- 采样：`temperature=1.0`，`top_p=0.95`，`reasoning_effort=max`
+- 上下文：1,000,000 token
+- 资源：每 attempt 2 CPU / 16 GiB memory / 20 GiB storage，20 个 task worker
+- 运行时：ACN `acn_eval` + Pier 容器评测；模型走 Responses 兼容协议
+- 分母：计划题数固定，不把失败题从分母里删掉
 
-见 [docs/results.md](docs/results.md)。当前状态：待更新。
+r8 是 `verified_producer_only` 四臂对照，111 题，通过口径为 Pier `reward=1`。四臂均有完整 usage ledger。Claim 主结果只读这一张表。
 
-## 文档
+方法学细节见 [docs/methodology.md](docs/methodology.md)。评测 runner 的安装与复跑见 [docs/runner.md](docs/runner.md)。
 
-- [docs/methodology.md](docs/methodology.md)：数据集、官方口径、ACN 对齐配置、四臂可见性矩阵、分层与
-  指标定义
-- [docs/acn_integration.md](docs/acn_integration.md)：ACN 侧文件、`acn_eval` 构建与 CLI、attempt TOML、
-  `result.json` / `events.jsonl` 契约
-- [docs/automated_run.md](docs/automated_run.md)：Smoke → Full 自动化、两阶段接续、续跑与监控
-- [docs/solver_aligned_run.md](docs/solver_aligned_run.md)：解题对齐全量运行
-- [docs/claim_harness_experiment.md](docs/claim_harness_experiment.md)：两个 ACN revision 的异机配对
-  实验协议
-- [docs/claim_harness_design.md](docs/claim_harness_design.md)：被评测的 claim harness 变体设计
-- [docs/results.md](docs/results.md)：结果（待更新）
+## 1. Coding Harness
 
-## 来源
+### 1.1 Standard Full-113
 
-runner 源码剥离自 ACN 仓库 `feature/deepswe-claim-harness` 分支
-`778c06756c6afc63f45fe1d1400054fae9c9bcd4` 的 `benchmarks/deepswe/`。独立成仓后唯一的行为改动是：
-ACN checkout 不再从 runner 所在路径推断，改由启动配置的 `acn_checkout` 显式指定；构建脚本以
-`--acn-checkout` 接收同一路径。Rust 侧的 `acn_eval` 与 evaluation profile 留在 ACN 仓库，锚点见
-[docs/acn_integration.md](docs/acn_integration.md)。
+闭环实验，四臂各 113 个有效结果，aggregate `passed`。`harness_mode=standard`，模型记录名 `deepseek-v4-flash-local-exp`。通过口径为 verifier 严格通过。
 
-## 参与贡献
+| 指标 | A | `B_empty` | `B_claim` | `B_forced_claim` |
+| --- | ---: | ---: | ---: | ---: |
+| 严格通过 | **54/113（47.79%）** | **52/113（46.02%）** | 44/113（38.94%） | 50/113（44.25%） |
+| 题均整体验收率 | 95.28% | 95.48% | 92.65% | 96.44% |
+| 题均 F2P | 87.11% | 88.64% | 83.25% | 87.48% |
+| 题均 P2P | 97.99% | 98.71% | 99.80% | 99.76% |
+| 模型请求 | 12,427 | 12,479 | 12,516 | 12,231 |
+| 输入 token | 1,924,719,428 | 1,888,458,849 | 1,936,412,276 | 1,845,113,368 |
 
-见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+这是目前最干净的「ACN 能解题」数字：A 接近一半严格通过，无 claim 基线同量级。该次 claim 两臂低于 `B_empty`，不在本节解释为知识复用收益；claim 主结果见第 2 节。
 
-## 许可证
+### 1.2 与 MiniSWE 的 Bash-parity
 
-MIT OR Apache-2.0，见 [LICENSE-MIT](LICENSE-MIT) 与 [LICENSE-APACHE](LICENSE-APACHE)。
+ACN Bash-parity r4 与两次 MiniSWE 对照，分母 113，严格通过。
+
+| 运行 | 通过 | 相对 ACN | exact McNemar p |
+| --- | ---: | ---: | ---: |
+| ACN Bash-parity r4 | **52/113（46.0%）** | — | — |
+| MiniSWE attempt 1 | 59/113（52.2%） | −6.2pp | 0.360 |
+| MiniSWE attempt 2 | 54/113（47.8%） | −1.8pp | 0.868 |
+
+ACN 113 题全部形成有效结果，0 Pier/agent exception、0 空 patch。相对 MiniSWE attempt 1，ACN 独过 18、MiniSWE 独过 25；相对 attempt 2 为 17 和 19。差距落在单次波动范围内，不能解释成 ACN runtime 大面积不可用。
+
+ACN 61 个失败里，46 个是 feature gap 且无 P2P 回归；44 个失败的 verifier partial ≥ 0.95，12 个只差一个 scored test。更像「复杂修改能做完、隐藏边界近失」，而不是 runner 或 patch 管道损坏。
+
+### 1.3 Pi-like：通过率持平，交互更省
+
+固定 30 题、四种 ACN 内部 harness、各 3 次重复，共 90 个 A-only 观测；12 个子 run aggregate 均为 `passed`。Pi-like 是 ACN 内部的工具与上下文组合：精简 prompt，解题工具面以受管 shell、`file_read`、`file_write` 为主，并调整分页与压缩。它不是外部同名产品的复刻。
+
+| Harness | 通过 | 请求 | 输入 token | 相对 Standard |
+| --- | ---: | ---: | ---: | --- |
+| Standard | 46/90（51.1%） | 10,637 | 1,740,780,205 | 基线 |
+| Concise | 40/90（44.4%） | 11,246 | 1,628,488,977 | 请求 +5.7%，输入 −6.5% |
+| **Pi-like** | **47/90（52.2%）** | **9,901** | **1,474,897,505** | **请求 −6.9%，输入 −15.3%** |
+| OpenCode-like | 39/90（43.3%） | 11,460 | 1,728,781,910 | 请求 +7.7%，输入 −0.7% |
+
+Pi-like 输出 token 相对 Standard 再少 5.4%。只缩短 prompt、保留 Standard 工具面的 Concise 反而请求更多、通过更少，说明收益来自工具面与上下文策略，不是「更短系统提示」本身。
+
+| 重复 | Standard 通过 | Pi-like 通过 | Standard 请求 | Pi-like 请求 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 15/30 | 17/30 | 3,456 | 3,318（−4.0%） |
+| 2 | 14/30 | 16/30 | 3,699 | 3,265（−11.7%） |
+| 3 | 17/30 | 14/30 | 3,482 | 3,318（−4.7%） |
+| 合计 | 46/90 | 47/90 | 10,637 | 9,901（−6.9%） |
+
+通过率三次有正有负，合计只多 1 个 task-run，不写成质量碾压。请求下降三次方向一致。30 题是定向 canary，不是 Full-113 的自然分布。
+
+## 2. Claim Reuse
+
+### 2.1 r8 四臂对照
+
+r8 在 DeepSWE v1.1 上跑 `verified_producer_only` 四臂，111 题，Pier 通过。主对照是按需 claim 对无 claim 基线。
+
+| 臂 | Pier 通过 | 输入 token | 输出 token | 模型请求 | 题均请求 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A | 72/111（64.86%） | 2,183,995,907 | 18,908,933 | 13,221 | 119.1 |
+| `B_empty` | 63/111（56.76%） | 2,290,656,202 | 19,728,252 | 13,532 | 121.9 |
+| **`B_claim`** | **73/111（65.77%）** | **1,927,317,486** | **19,002,375** | **12,141** | **109.4** |
+| `B_forced_claim` | 65/111（58.56%） | 1,893,296,192 | 18,986,467 | 12,124 | 109.2 |
+
+按需 claim 是四臂里通过率最高的一臂（73/111），比无 claim 多 10 题、高 9.0 个百分点，并与 producer 臂 A（72/111）持平。强制注入通过 65/111，只比基线多 2 题，说明收益主要来自模型按需取用，而不是把同一批 claim 一律塞进上下文。
+
+成本上，`B_claim` 相对 `B_empty` 全面更省：输入少 3.63 亿 token（−15.9%），请求少 1,391 次（−10.3%），输出少 3.7%。111 题配对里，78 题输入更低、73 题请求更少。题均请求从 121.9 降到 109.4。强制臂的输入和请求同样低于基线，但通过率几乎不涨，所以不把它写成质量优势。
+
+| 配对（`B_claim` − `B_empty`） | 题均差 | 中位差 | claim 更低的题数 | 相对变化 |
+| --- | ---: | ---: | ---: | ---: |
+| 输入 token | −3,273,322 | −2,372,801 | 78/111 | −15.9% |
+| 输出 token | −6,539 | −2,857 | 58/111 | −3.7% |
+| reasoning token | −4,432 | −2,245 | 59/111 | −3.2% |
+| 模型请求 | −12.5 | −12 | 73/111 | −10.3% |
+
+通过率配对：claim 独过 20、独挂 10、双过 53、双挂 28。双侧 exact McNemar p ≈ 0.099。方向一致，尚未跨过 0.05。适合作为 r8 的主结论来展示，不写成已经统计显著的全量碾压。
+
+### 2.2 Claim 命中与「用上才涨分」
+
+`B_claim` 111 题漏斗：
+
+| 事件 | 题数 | 条数 |
+| --- | ---: | ---: |
+| bundle 可用 / 检索到 / 注入 | 55/111 | 注入 240 条 |
+| 判定 `used` | 46/111 | 用上 169 条 |
+
+按是否真正用上 claim 切开，对照仍是同题 `B_empty`：
+
+| 子集 | n | `B_empty` | `B_claim` | 独过 / 独挂 |
+| --- | ---: | ---: | ---: | ---: |
+| 注入成功 | 55 | 37/55 | **47/55** | 13 / 3 |
+| 判定 used | 46 | 30/46 | **39/46** | 11 / 2 |
+| A 已 Pier 通过 | 72 | 49/72 | **60/72** | 16 / 5 |
+
+used 子集上，输入 token 题均约 −290 万（33 题更低），请求题均 −12.1（31 题更少）。复用信号和成本下降出现在同一批「claim 进入上下文」的题目上，而不是靠把失败经验灌进全量消费者。
+
+### 2.3 成功 producer 的条件效应
+
+一次已完成的 Standard Full-113（claim-delivery 优化，严格通过）按 producer 是否通过 verifier 分层。全量总分没有 uplift（见附录），但成功 producer 且产出 claim 的 40 题上：
+
+| 对照 | `B_empty` | Claim arm | 差 | 独过 / 独挂 | exact p |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `B_claim` | 21/40 | **27/40** | **+15.0pp** | 11 / 5 | 0.210 |
+| `B_forced_claim` | 21/40 | **26/40** | **+12.5pp** | 11 / 6 | 0.332 |
+
+失败 producer 仍产出 claim 的 68 题上，按需 / 强制分别为 11/68、12/68，对照 24/68，明显变差。这支持 ACN 的产品默认：**只把 verifier 通过的 producer claim 送进正常检索**，失败经验隔离，而不是「注入更多上下文」。
+
+### 2.4 跨实验重复的正向案例
+
+严格正向：同一 run、同一题 `B_empty` 失败、claim 臂严格通过，且 `claim_observation.injected=true`。下列三题在三次独立 Full-113 里重复出现。
+
+| 题 | 交付 | `B_empty` | Claim 臂 | 注入记录 | producer 也通过 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `arktype-json-schema-refs-dependencies` | on-demand | 0/3 | **3/3** | 3/3 | 3/3 |
+| `kcp-go-multiplexed-kcp-streams` | forced | 0/3 | **3/3** | 3/3 | 2/3 |
+| `prometheus-transactional-reload-status` | forced | 0/3 | **3/3** | 3/3 | 2/3 |
+
+可复用内容是具体工程约束（递归 `$ref` 延迟解析、KCP frame 长度与关闭顺序、事务式 reload 状态机），不是泛化提示。它们是案例，不是全量成功率。
+
+## What This Supports, and What It Does Not
+
+可以说：
+
+- ACN Standard 在完整 113 题上达到接近一半的严格通过，并能与 MiniSWE 同场对照。
+- r8 四臂中，按需 claim 比无 claim 多过 10 题，输入 token 少 16%，请求少 10%。
+- claim 用上之后，通过率差距进一步拉开；失败 producer 的 claim 会伤害后续解题，所以质量门控是机制的一部分，不是事后补丁。
+- Pi-like 在 30 题 × 3 次上保持通过率，并稳定减少请求和输入。
+
+不可以说：
+
+- 任意 claim、任意注入方式都能提高通过率。强制臂在 r8 上几乎不涨分。
+- Pi-like 已在 Full-113 上取得效率或质量优势。
+- McNemar p≈0.099 或成功 producer 40 题 p=0.21 已经达到常用显著线。
+
+## Appendix A. Other Closed Full-113 Tables
+
+### A.1 2026-08-30 Standard · claim-delivery 优化 · 全量
+
+四臂 113/113 有效，aggregate `passed`。用来说明：**没有质量门控时，全量 claim 不一定高于 `B_empty`。** 第 2.3 节的 +15pp 来自这次实验的成功 producer 子集，不能代替下表。
+
+| 指标 | A | `B_empty` | `B_claim` | `B_forced_claim` |
+| --- | ---: | ---: | ---: | ---: |
+| 严格通过 | 42/113（37.17%） | 47/113（41.59%） | 42/113（37.17%） | 43/113（38.05%） |
+| 模型请求 | 13,191 | 13,668 | 13,189 | 12,639 |
+| 输入 token | 2,046,128,531 | 2,274,419,883 | 2,191,873,914 | 1,955,384,454 |
+
+### A.2 成功 producer 子集的跨 run 复核
+
+同一分层（A 通过且产出 claim）在不同闭环 Full-113 上并不总是正：
+
+| 实验 | 有效配对 | `B_empty` | `B_claim` | `B_forced_claim` |
+| --- | ---: | ---: | ---: | ---: |
+| 08-26 Standard | 54 | 34/54 | 31/54 | 38/54 |
+| 08-29 Minimal | 43 | 28/43 | 26/43 | 26/43 |
+| 08-30 Standard opt | 40 | 21/40 | 27/40 | 26/40 |
+
+08-30 是最强的正向子集；08-26 / 08-29 同类子集接近或为负。跨 run 不稳定，所以正文以 r8 总表为主，40 题 +15pp 只作为质量门控的条件证据。
+
+## Appendix B. Protocol Notes
+
+- Pass / Pier / Gate 三者分开：Gate `pass` 只表示实验证据齐，不等于解题成功。
+- 题均 F2P / P2P / partial 是逐题等权平均，不是把全部测试用例池化。
+- Token 为 usage ledger 观测值；若存在 incomplete model response，总量视为下界。r8 四臂的 `audit_incomplete` 均为 0。
+- 模型请求按 ledger 实计，不是计费，也不是墙钟。
+- `injected` 是客观交付事件；`used` 来自 finalize recap 自报，需与通过率配对一起读。
+- 未收录中断、未齐分母、以及样本过小的诊断轮次。
+
+## Citation
+
+```bibtex
+@misc{acn-deepswe-eval-2026,
+  title        = {ACN on DeepSWE: Coding Harness and Claim Reuse},
+  author       = {Agent Claim Network},
+  year         = {2026},
+  howpublished = {https://github.com/FTShare-Lab/acn-deepswe-eval},
+  note         = {DeepSWE v1.1 four-arm evaluation}
+}
+```

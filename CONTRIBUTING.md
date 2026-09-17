@@ -26,7 +26,7 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
   任何真实部署的路由别名。
 - 配置文件不承载 credential；模型 key 与 base URL 只从 `ACN_EVAL_UPSTREAM_KEY` /
   `ACN_EVAL_UPSTREAM_BASE_URL` 环境变量读取，runner 会拒绝包含 key 字段的配置。
-- 评测结果只在 [docs/results.md](docs/results.md) 发布，且必须附带可重建的 provenance；不得把
+- 评测结果只在 [README.md](README.md) 发布，且必须附带可重建的 provenance；不得把
   单次、未过 Gate 或未冻结出口模式的运行写成正式分数。
 - 任务源码、容器日志与模型输出不进入仓库。
 

@@ -1,6 +1,6 @@
 # ACN DeepSWE Evaluation
 
-[中文](README.md)
+[中文评测报告](README.md) · [Chinese runner](docs/runner.md)
 
 This repository is the auditable evaluation runner for
 [Agent Claim Network (ACN)](https://github.com/FTShare-Lab/agent-claim-network) on
@@ -19,7 +19,7 @@ The evaluation answers two questions: where ACN without claims lands on DeepSWE 
 agent steps; and whether, on the same model and the same tasks, a second fresh agent that receives the
 claims frozen from a previous agent through the router outperforms a fresh agent without claims. The
 methodology is in [docs/methodology.md](docs/methodology.md) (Chinese); results are in
-[docs/results.md](docs/results.md) (pending).
+[README.md](README.md).
 
 ## Four arms
 
@@ -264,7 +264,7 @@ keeping prior artifacts and retry counts.
 
 ## Results
 
-See [docs/results.md](docs/results.md). Status: pending.
+See [README.md](README.md).
 
 ## Documentation
 
@@ -281,7 +281,7 @@ All documents are in Chinese.
   between two ACN revisions
 - [docs/claim_harness_design.md](docs/claim_harness_design.md): design of the evaluated claim harness
   variant
-- [docs/results.md](docs/results.md): results (pending)
+- [README.md](README.md): evaluation report (Chinese)
 
 ## Provenance
 

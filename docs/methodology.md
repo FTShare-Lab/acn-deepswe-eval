@@ -1,7 +1,7 @@
 # 评测方法
 
 > 状态：Pre-smoke / Smoke / Full 的评测基础设施已实现；真实运行按冻结配置在评测机单独启动并保留
-> provenance。结果见 [results.md](results.md)。
+> provenance。结果见仓库首页 [README.md](../README.md)。
 
 本文是本仓库的方法学口径。运行契约以本文与 [README](../README.md) 为准，不把首期方案中的历史实施
 要求视为已完成能力。
