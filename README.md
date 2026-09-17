@@ -72,7 +72,7 @@ ACN 主实验在同一模型上的位置（Pier 通过，111 题，单次运行�
 | 项目 | 取值 |
 | --- | --- |
 | 基准 | DeepSWE v1.1，冻结 113 题 |
-| 模型 | 主实验 DeepSeek-V4.1-Flash；Standard 全量运行 DeepSeek-V4-Flash；其余轮次以各自冻结记录为准 |
+| 模型 | 主实验与 Standard 全量运行均为 DeepSeek-V4.1-Flash；其余轮次以各自冻结记录为准 |
 | 采样 | `temperature=1.0`，`top_p=0.95`，`reasoning_effort=max`，上下文 1,000,000 token |
 | 资源 | 每次运行 2 CPU / 16 GiB 内存 / 20 GiB 存储，20 路并行 |
 | 运行时 | ACN 评测二进制 + Pier 容器与官方 verifier |
@@ -170,7 +170,7 @@ ACN 默认只把通过 verifier 的 producer claim 送进检索，失败经验�
 
 ### 2.1 Standard 全量运行
 
-四臂各 113 个有效结果，Standard 模式，模型 DeepSeek-V4-Flash，严格通过。
+四臂各 113 个有效结果，Standard 模式，模型 DeepSeek-V4.1-Flash，严格通过。
 
 | 指标 | `A` | `B_empty` | `B_claim` | `B_forced_claim` |
 | --- | ---: | ---: | ---: | ---: |
